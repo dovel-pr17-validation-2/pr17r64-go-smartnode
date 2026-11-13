@@ -1,0 +1,141 @@
+package pdao
+
+import (
+	"fmt"
+	"strconv"
+
+	"github.com/rocket-pool/smartnode/bindings/transactions/gaslimit"
+	"github.com/rocket-pool/smartnode/bindings/types"
+
+	cliutils "github.com/rocket-pool/smartnode/rocketpool-cli/cli"
+	"github.com/rocket-pool/smartnode/rocketpool-cli/cli/prompt"
+	"github.com/rocket-pool/smartnode/shared/services/gas"
+	"github.com/rocket-pool/smartnode/shared/services/rocketpool"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func executeProposal(proposal string, yes bool) error {
+
+	// Get RP client
+	rp, err := rocketpool.NewClient().WithReady()
+	if err != nil {
+		return err
+	}
+	defer rp.Close()
+
+	// Get protocol DAO proposals
+	proposals, err := rp.PDAOProposals()
+	if err != nil {
+		return err
+	}
+
+	// Get executable proposals
+	executableProposals := []api.PDAOProposalWithNodeVoteDirection{}
+	for _, proposal := range proposals.Proposals {
+		if proposal.State == types.ProtocolDaoProposalState_Succeeded {
+			executableProposals = append(executableProposals, proposal)
+		}
+	}
+
+	// Check for executable proposals
+	if len(executableProposals) == 0 {
+		fmt.Println("No proposals can be executed.")
+		return nil
+	}
+
+	// Get selected proposal
+	var selectedProposals []api.PDAOProposalWithNodeVoteDirection
+	if proposal == "all" {
+
+		// Select all proposals
+		selectedProposals = executableProposals
+
+	} else if proposal != "" {
+
+		// Get selected proposal ID
+		selectedId, err := strconv.ParseUint(proposal, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid proposal ID '%s': %w", proposal, err)
+		}
+
+		// Get matching proposal
+		found := false
+		for _, proposal := range executableProposals {
+			if proposal.ID == selectedId {
+				selectedProposals = []api.PDAOProposalWithNodeVoteDirection{proposal}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("proposal %d can not be executed", selectedId)
+		}
+
+	} else {
+
+		// Prompt for proposal selection
+		options := make([]string, len(executableProposals)+1)
+		options[0] = "All available proposals"
+		for pi, proposal := range executableProposals {
+			message, payload := proposalDisplayText(proposal)
+			options[pi+1] = fmt.Sprintf("proposal %d (message: '%s', payload: %s)", proposal.ID, message, payload)
+		}
+		selected, _ := prompt.Select("Please select a proposal to execute:", options)
+
+		// Get proposals
+		if selected == 0 {
+			selectedProposals = executableProposals
+		} else {
+			selectedProposals = []api.PDAOProposalWithNodeVoteDirection{executableProposals[selected-1]}
+		}
+
+	}
+
+	if len(selectedProposals) == 1 {
+		printSelectedMultiSettings(selectedProposals[0].MultiSettings)
+	}
+
+	// Get the total gas limit estimate
+	var gasLimits gaslimit.Limits
+	for _, proposal := range selectedProposals {
+		canResponse, err := rp.PDAOCanExecuteProposal(proposal.ID)
+		if err != nil {
+			fmt.Printf("WARNING: Couldn't get gas price for execute transaction (%s)", err.Error())
+			break
+		}
+		gasLimits = gasLimits.Add(canResponse.GasLimits)
+	}
+
+	// Assign max fees
+	err = gas.AssignMaxFeeAndLimit(gasLimits, rp, yes)
+	if err != nil {
+		return err
+	}
+
+	// Prompt for confirmation
+	if prompt.Declined(yes, "Are you sure you want to execute %d proposals?", len(selectedProposals)) {
+		fmt.Println("Cancelled.")
+		return nil
+	}
+
+	// Execute proposals
+	for _, proposal := range selectedProposals {
+		response, err := rp.PDAOExecuteProposal(proposal.ID)
+		if err != nil {
+			fmt.Printf("Could not execute proposal %d: %s.\n", proposal.ID, err)
+			continue
+		}
+
+		fmt.Printf("Executing proposal...\n")
+		cliutils.PrintTransactionHash(rp, response.TxHash)
+		if _, err = rp.WaitForTransaction(response.TxHash); err != nil {
+			fmt.Printf("Could not execute proposal %d: %s.\n", proposal.ID, err)
+		} else {
+			fmt.Printf("Successfully executed proposal %d.\n", proposal.ID)
+		}
+	}
+
+	// Return
+	return nil
+
+}

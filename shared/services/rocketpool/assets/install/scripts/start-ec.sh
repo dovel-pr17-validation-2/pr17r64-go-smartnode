@@ -1,0 +1,681 @@
+#!/bin/sh
+# This script launches ETH1 clients for Rocket Pool's docker stack; only edit if you know what you're doing ;)
+#
+# Rolling history expiry keeps ~1 year of bodies/receipts (82125 epochs / 2628000 blocks).
+
+# Performance tuning for ARM systems
+define_perf_prefix() {
+    # Get the number of available cores
+    CORE_COUNT=$(nproc)
+
+    # Don't do performance tweaks on systems with 6+ cores
+    if [ "$CORE_COUNT" -gt "5" ]; then
+        echo "$CORE_COUNT cores detected, skipping performance tuning"
+        return 0
+    else
+        echo "$CORE_COUNT cores detected, activating performance tuning"
+    fi
+
+    # Give the EC access to the last core
+    CURRENT_CORE=$((CORE_COUNT - 1))
+    CORE_STRING="$CURRENT_CORE"
+
+    # If there are more than 2 cores, limit the EC to use all but the first one
+    CURRENT_CORE=$((CURRENT_CORE - 1))
+    while [ "$CURRENT_CORE" -gt "0" ]; do
+        CORE_STRING="$CORE_STRING,$CURRENT_CORE"
+        CURRENT_CORE=$((CURRENT_CORE - 1))
+    done
+
+    PERF_PREFIX="taskset -c $CORE_STRING ionice -c 3"
+    echo "Performance tuning: $PERF_PREFIX"
+}
+
+# Set up the network-based flags from BEACON_NETWORK (the Ethereum client network name).
+if [ -z "$BEACON_NETWORK" ]; then
+    echo "BEACON_NETWORK is not set"
+    exit 1
+fi
+if [ "$BEACON_NETWORK" = "mainnet" ]; then
+    GETH_NETWORK=""
+    RP_NETHERMIND_NETWORK="mainnet"
+    BESU_NETWORK="--network=mainnet"
+    RETH_NETWORK="--chain mainnet"
+    ERIGON_NETWORK="--chain mainnet"
+else
+    GETH_NETWORK="--$BEACON_NETWORK"
+    RP_NETHERMIND_NETWORK="$BEACON_NETWORK"
+    BESU_NETWORK="--network=$BEACON_NETWORK"
+    RETH_NETWORK="--chain $BEACON_NETWORK"
+    ERIGON_NETWORK="--chain $BEACON_NETWORK"
+fi
+
+
+# Geth startup
+if [ "$CLIENT" = "geth" ]; then
+
+    # Geth has no --plataberget preset. Keep this EL-only config separate from
+    # CUSTOM_CHAIN_DIR so consensus clients can still use their named presets.
+    if [ "$BEACON_NETWORK" = "plataberget" ]; then
+        if [ ! -s /network-config/genesis.json ] || [ ! -s /network-config/el_enrs.txt ]; then
+            echo "Plataberget Geth network files are missing; run rocketpool service install to install them"
+            exit 1
+        fi
+        GETH_NETWORK="--networkid 7091047534 --override.genesis /network-config/genesis.json"
+        GETH_BOOTNODES=$(tr -d '\r' < /network-config/el_enrs.txt | awk 'NF { printf "%s%s", sep, $0; sep="," }')
+        if [ -z "$GETH_BOOTNODES" ]; then
+            echo "Plataberget Geth bootnodes are empty"
+            exit 1
+        fi
+    fi
+
+    # Performance tuning for ARM systems
+    UNAME_VAL=$(uname -m)
+    if [ "$UNAME_VAL" = "arm64" ] || [ "$UNAME_VAL" = "aarch64" ]; then
+
+        # Install taskset and ionice
+        apk add util-linux
+
+        # Define the performance tuning prefix
+        define_perf_prefix
+
+    fi
+
+    # Check for the prune flag and run that first if requested
+    if [ -f "/ethclient/prune.lock" ]; then
+
+        if [ "$EC_PRUNING_MODE" = "historyExpiry" ] || [ "$EC_PRUNING_MODE" = "rollingHistoryExpiry" ]; then
+            if [ "$EC_PRUNING_MODE" = "rollingHistoryExpiry" ]; then
+                echo "Geth does not support rolling history expiry; prune-history only removes pre-merge data"
+                echo "A resync is required to drop pre-Prague history"
+            fi
+            $PERF_PREFIX /usr/local/bin/geth prune-history $GETH_NETWORK --datadir /ethclient/geth ; rm /ethclient/prune.lock    
+        fi
+
+        if [ "$EC_PRUNING_MODE" = "fullNode" ]; then
+            $PERF_PREFIX /usr/local/bin/geth snapshot prune-state $GETH_NETWORK --datadir /ethclient/geth ; rm /ethclient/prune.lock
+        fi
+
+    elif [ -f "/ethclient/migrate-v2" ]; then
+        echo "Migrating Geth database from Pebble v1 to Pebble v2"
+        rm -f /ethclient/migrate-v2
+        $PERF_PREFIX /usr/local/bin/geth db pebble-upgrade $GETH_NETWORK --datadir /ethclient/geth
+
+    # Run Geth normally
+    else
+
+        CMD="$PERF_PREFIX /usr/local/bin/geth $GETH_NETWORK \
+            --datadir /ethclient/geth \
+            --http \
+            --http.addr 0.0.0.0 \
+            --http.port ${EC_HTTP_PORT:-8545} \
+            --http.api eth,net,web3 \
+            --http.corsdomain=* \
+            --ws \
+            --ws.addr 0.0.0.0 \
+            --ws.port ${EC_WS_PORT:-8546} \
+            --ws.api eth,net,web3 \
+            --authrpc.addr 0.0.0.0 \
+            --authrpc.port ${EC_ENGINE_PORT:-8551} \
+            --authrpc.jwtsecret /secrets/jwtsecret \
+            --authrpc.vhosts=* \
+            --pprof \
+            $EC_ADDITIONAL_FLAGS"
+
+        # Refresh the public IP via STUN without predicting the advertised discovery port.
+        # Preserve an explicit NAT setting supplied in Additional Flags.
+        if ! printf '%s\n' "$EC_ADDITIONAL_FLAGS" | grep -Eq -- '(^|[[:space:]])--nat(=|[[:space:]]|$)'; then
+            CMD="$CMD --nat stun"
+        fi
+
+        if [ "$BEACON_NETWORK" = "plataberget" ]; then
+            CMD="$CMD --bootnodes $GETH_BOOTNODES --discovery.v4=false --discovery.v5=true"
+        fi
+
+        if [ -n "$CUSTOM_CHAIN_DIR" ]; then\
+            CMD="$CMD --bootnodes $BOOTNODE_ENODE_LIST"
+        fi
+        if [ ! -z "$EC_SUGGESTED_BLOCK_GAS_LIMIT" ]; then
+            CMD="$CMD --miner.gaslimit $EC_SUGGESTED_BLOCK_GAS_LIMIT"
+        fi
+        
+        if [ "$EC_PRUNING_MODE" = "archive" ]; then
+            CMD="$CMD --syncmode=full --gcmode=archive --history.state=0"
+        fi
+
+        if [ "$EC_PRUNING_MODE" = "historyExpiry" ]; then
+            CMD="$CMD --history.chain postmerge"
+        fi
+
+        if [ "$EC_PRUNING_MODE" = "rollingHistoryExpiry" ]; then
+            echo "Geth does not support rolling history expiry; using pre-Prague history expiry (--history.chain postprague)"
+            CMD="$CMD --history.chain postprague"
+        fi
+
+        if [ ! -z "$GETH_EVM_TIMEOUT" ]; then
+            CMD="$CMD --rpc.evmtimeout ${GETH_EVM_TIMEOUT}s"
+        fi
+        
+        if [ ! -z "$ETHSTATS_LABEL" ] && [ ! -z "$ETHSTATS_LOGIN" ]; then
+            CMD="$CMD --ethstats $ETHSTATS_LABEL:$ETHSTATS_LOGIN"
+        fi
+
+        if [ ! -z "$EC_MAX_PEERS" ]; then
+            CMD="$CMD --maxpeers $EC_MAX_PEERS"
+        fi
+
+        if [ "$ENABLE_METRICS" = "true" ]; then
+            CMD="$CMD --metrics --metrics.addr 0.0.0.0 --metrics.port $EC_METRICS_PORT"
+        fi
+
+        if [ ! -z "$EC_P2P_PORT" ]; then
+            CMD="$CMD --port $EC_P2P_PORT"
+        fi
+
+        exec ${CMD} --http.vhosts '*'
+
+    fi
+
+fi
+
+
+# Nethermind startup
+if [ "$CLIENT" = "nethermind" ]; then
+
+    # Performance tuning for ARM systems
+    UNAME_VAL=$(uname -m)
+    if [ "$UNAME_VAL" = "arm64" ] || [ "$UNAME_VAL" = "aarch64" ]; then
+
+        # Define the performance tuning prefix
+        define_perf_prefix
+
+    fi
+
+    # Create the JWT secret
+    if [ ! -f "/secrets/jwtsecret" ]; then
+        openssl rand -hex 32 | tr -d "\n" > /secrets/jwtsecret
+    fi
+
+    # Set the JSON RPC logging level
+    LOG_LINE=$(awk '/<logger name=\"\*\" minlevel=\"Off\" writeTo=\"seq\" \/>/{print NR}' /nethermind/NLog.config)
+    sed -e "${LOG_LINE} i \    <logger name=\"JsonRpc\.\*\" final=\"true\"/>\\n" -i /nethermind/NLog.config
+    sed -e "${LOG_LINE} i \    <logger name=\"JsonRpc\.\*\" minlevel=\"Warn\" writeTo=\"auto-colored-console-async\" final=\"true\"/>" -i /nethermind/NLog.config
+    sed -e "${LOG_LINE} i \    <logger name=\"JsonRpc\.\*\" minlevel=\"Warn\" writeTo=\"file-async\" final=\"true\"/>" -i /nethermind/NLog.config
+
+    # Remove the sync peers report but leave error messages
+    sed -e "${LOG_LINE} i \    <logger name=\"Synchronization.Peers.SyncPeersReport\" maxlevel=\"Info\" final=\"true\"/>" -i /nethermind/NLog.config
+    sed -i 's/<!-- \(<logger name=\"Synchronization\.Peers\.SyncPeersReport\".*\/>\).*-->/\1/g' /nethermind/NLog.config
+
+    # Get the binary name (changed with v1.21, required for backwards compatibility)
+    if [ -f "/nethermind/Nethermind.Runner" ]; then
+        NETHERMIND_BINARY=/nethermind/Nethermind.Runner
+    elif [ -f "/nethermind/nethermind" ]; then
+        NETHERMIND_BINARY=/nethermind/nethermind
+    else
+        echo "Nethermind binary not found, cannot start Execution Client."
+        exit 1
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "archive" ]; then
+        RP_NETHERMIND_NETWORK="${RP_NETHERMIND_NETWORK}_archive"
+    fi
+
+    # Detect persisted state before selecting pruning flags or a fresh FlatDB layout.
+    NETHERMIND_DB=$(sh /setup/nethermind-db.sh) || exit 1
+    # A fresh/resynced database uses FlatDB in v2.0 unless explicitly opted out.
+    if [ "$NETHERMIND_DB" = "none" ] && printf '%s\n' "$EC_ADDITIONAL_FLAGS" | grep -Eiq -- '(^|[[:space:]])--(flatdb\.enabled|flatdb-enabled)(=|[[:space:]]+)false([[:space:]]|$)'; then
+        NETHERMIND_DB=patricia
+    fi
+
+    # Prefer FlatInTrie for fresh FlatDB syncs on machines with up to 16 GiB RAM.
+    # Persisting the choice so restarts and RAM upgrades cannot change an existing database's layout. resync-eth1
+    # deletes this marker together with the execution data volume.
+    NETHERMIND_LAYOUT_FLAGS=""
+    NETHERMIND_LAYOUT_MARKER=/ethclient/nethermind/.smartnode-flat-in-trie
+    if [ "$NETHERMIND_DB" != "patricia" ] &&
+        [ -z "$NETHERMIND_FLATDBCONFIG_LAYOUT" ] && [ -z "$NETHERMIND_FLATDB_LAYOUT" ] &&
+        ! printf '%s\n' "$EC_ADDITIONAL_FLAGS" | grep -Eiq -- '(^|[[:space:]])--(flatdb\.layout|flatdb-layout)(=|[[:space:]])'; then
+        if [ "$NETHERMIND_DB" = "none" ] && [ ! -f "$NETHERMIND_LAYOUT_MARKER" ] &&
+            [ "$(awk '/^MemTotal:/ {print ($2 > 0 && $2 <= 16777216)}' /proc/meminfo)" = "1" ]; then
+            mkdir -p /ethclient/nethermind && touch "$NETHERMIND_LAYOUT_MARKER" || exit 1
+        fi
+        if [ -f "$NETHERMIND_LAYOUT_MARKER" ]; then
+            NETHERMIND_LAYOUT_FLAGS="--FlatDb.Layout FlatInTrie"
+            echo "Using FlatInTrie, the saved Nethermind layout selected for a system with up to 16 GiB RAM."
+        fi
+    fi
+
+    NETHERMIND_LOCALIP_FLAGS=""
+    if [ "$ENABLE_IPV6" != "true" ] &&
+        [ -z "$NETHERMIND_NETWORKCONFIG_LOCALIP" ] &&
+        ! printf '%s\n' "$EC_ADDITIONAL_FLAGS" | grep -Eiq -- '(^|[[:space:]])--(network\.localip|network-localip)(=|[[:space:]])'; then
+        NETHERMIND_LOCALIP_FLAGS="--Network.LocalIp 0.0.0.0"
+    fi
+
+    # A flat archive synced from genesis cannot snap-resync. Ignore a RocksDB auto-repair
+    # instead of wiping flat state and attempting one.
+    NETHERMIND_REPAIR_FLAGS=""
+    if [ "$EC_PRUNING_MODE" = "archive" ] &&
+        [ -z "$NETHERMIND_FLATDBCONFIG_ONREPAIR" ] &&
+        ! printf '%s\n' "$EC_ADDITIONAL_FLAGS" | grep -Eiq -- '(^|[[:space:]])--(flatdb\.onrepair|flatdb-onrepair)(=|[[:space:]])'; then
+        NETHERMIND_REPAIR_FLAGS="--FlatDb.OnRepair Ignore"
+    fi
+
+    CMD="$PERF_PREFIX $NETHERMIND_BINARY \
+        --config $RP_NETHERMIND_NETWORK \
+        --data-dir /ethclient/nethermind \
+        --JsonRpc.Enabled true \
+        --JsonRpc.Host 0.0.0.0 \
+        --JsonRpc.Port ${EC_HTTP_PORT:-8545} \
+        --JsonRpc.EnginePort ${EC_ENGINE_PORT:-8551} \
+        --JsonRpc.EngineHost 0.0.0.0 \
+        --Init.WebSocketsEnabled true \
+        --JsonRpc.WebSocketsPort ${EC_WS_PORT:-8546} \
+        --JsonRpc.JwtSecretFile=/secrets/jwtsecret \
+        $NETHERMIND_LAYOUT_FLAGS \
+        $NETHERMIND_LOCALIP_FLAGS \
+        $NETHERMIND_REPAIR_FLAGS \
+        $EC_ADDITIONAL_FLAGS"
+
+    # TODO(Hegota): Drop automatic state pruning; FlatDB does not use it.
+    if [ "$NETHERMIND_DB" = "patricia" ] && [ "$EC_PRUNING_MODE" != "archive" ]; then
+        CMD="$CMD --Pruning.Mode=Hybrid \
+            --Pruning.FullPruningTrigger=VolumeFreeSpace \
+            --Pruning.FullPruningThresholdMb=$RP_NETHERMIND_FULL_PRUNING_THRESHOLD_MB \
+            --Pruning.FullPruningCompletionBehavior AlwaysShutdown \
+            --Pruning.FullPruningMaxDegreeOfParallelism=$RP_NETHERMIND_FULL_PRUNING_MAX_DEGREE_PARALLELISM"
+    fi
+
+    if [ ! -z "$EC_SUGGESTED_BLOCK_GAS_LIMIT" ]; then
+            CMD="$CMD --Blocks.TargetBlockGasLimit $EC_SUGGESTED_BLOCK_GAS_LIMIT"
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "archive" ]; then
+        CMD="$CMD --Sync.DownloadBodiesInFastSync=false --Sync.DownloadReceiptsInFastSync=false --Sync.FastSync=false --Sync.SnapSync=false --Sync.FastBlocks=false --Sync.PivotNumber=0"
+        CMD="$CMD --Receipt.TxLookupLimit=0"
+        if [ "$NETHERMIND_DB" = "patricia" ]; then
+            CMD="$CMD --Pruning.Mode=None"
+        fi
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "fullNode" ]; then
+        CMD="$CMD --Sync.AncientBodiesBarrier=0 --Sync.AncientReceiptsBarrier=0"
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "historyExpiry" ] && [ "$BEACON_NETWORK" = "mainnet" ]; then
+        CMD="$CMD --Sync.AncientBodiesBarrier=15537394 --Sync.AncientReceiptsBarrier=15537394"
+        CMD="$CMD --History.Pruning=UseAncientBarriers"
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "rollingHistoryExpiry" ]; then
+        CMD="$CMD --History.Pruning=Rolling"
+    fi
+    
+    # Add optional supplemental primary JSON-RPC modules
+    if [ ! -z "$RP_NETHERMIND_ADDITIONAL_MODULES" ]; then
+        RP_NETHERMIND_ADDITIONAL_MODULES=",${RP_NETHERMIND_ADDITIONAL_MODULES}"
+    fi
+    CMD="$CMD --JsonRpc.EnabledModules Eth,Net,Web3$RP_NETHERMIND_ADDITIONAL_MODULES"
+
+    # Add optional supplemental JSON-RPC URLs
+    if [ ! -z "$RP_NETHERMIND_ADDITIONAL_URLS" ]; then
+        RP_NETHERMIND_ADDITIONAL_URLS=",${RP_NETHERMIND_ADDITIONAL_URLS}"
+    fi
+    CMD="$CMD --JsonRpc.AdditionalRpcUrls [\"http://127.0.0.1:7434|http|admin\"$RP_NETHERMIND_ADDITIONAL_URLS]"
+
+    if [ ! -z "$ETHSTATS_LABEL" ] && [ ! -z "$ETHSTATS_LOGIN" ]; then
+        CMD="$CMD --EthStats.Enabled true --EthStats.Name $ETHSTATS_LABEL --EthStats.Secret $(echo $ETHSTATS_LOGIN | cut -d "@" -f1) --EthStats.Server $(echo $ETHSTATS_LOGIN | cut -d "@" -f2)"
+    fi
+
+    if [ ! -z "$EC_CACHE_SIZE" ]; then
+        CMD="$CMD --Init.MemoryHint ${EC_CACHE_SIZE}000000"
+    fi
+
+    if [ ! -z "$EC_MAX_PEERS" ]; then
+        CMD="$CMD --Network.MaxActivePeers $EC_MAX_PEERS"
+    fi
+
+    if [ "$ENABLE_METRICS" = "true" ]; then
+        CMD="$CMD --Metrics.Enabled true --Metrics.ExposePort $EC_METRICS_PORT"
+    fi
+
+    if [ ! -z "$EC_P2P_PORT" ]; then
+        CMD="$CMD --Network.DiscoveryPort $EC_P2P_PORT --Network.P2PPort $EC_P2P_PORT"
+    fi
+
+    # TODO(Hegota): Drop the Patricia state pruning memory settings.
+    if [ "$NETHERMIND_DB" = "patricia" ] && [ "$EC_PRUNING_MODE" != "archive" ]; then
+        if [ ! -z "$RP_NETHERMIND_PRUNE_MEM_SIZE" ]; then
+            CMD="$CMD --Pruning.CacheMb $RP_NETHERMIND_PRUNE_MEM_SIZE"
+        fi
+
+        if [ ! -z "$RP_NETHERMIND_FULL_PRUNE_MEMORY_BUDGET" ]; then
+            CMD="$CMD --Pruning.FullPruningMemoryBudgetMb $RP_NETHERMIND_FULL_PRUNE_MEMORY_BUDGET"
+        fi
+    fi
+    
+    exec ${CMD}
+
+fi
+
+
+# Besu startup
+if [ "$CLIENT" = "besu" ]; then
+
+    # Performance tuning for ARM systems
+    UNAME_VAL=$(uname -m)
+    if [ "$UNAME_VAL" = "arm64" ] || [ "$UNAME_VAL" = "aarch64" ]; then
+
+        # Define the performance tuning prefix
+        define_perf_prefix
+
+    fi
+
+    # Create the JWT secret
+    if [ ! -s "/secrets/jwtsecret" ]; then
+        echo -n "$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d '[:space:]')" > /secrets/jwtsecret
+    fi
+
+    # Check for the prune flag and run that first if requested.
+    # Rolling expiry is applied at startup via Xchain-pruning flags, so skip the
+    # offline pre-merge prune in that mode.
+    if [ -f "/ethclient/prune.lock" ] && [ "$EC_PRUNING_MODE" != "rollingHistoryExpiry" ]; then
+
+        $PERF_PREFIX /opt/besu/bin/besu $BESU_NETWORK --data-path=/ethclient/besu --history-expiry-prune storage trie-log prune ; rm /ethclient/prune.lock
+
+    # Run Besu normally
+    else
+        if [ -f "/ethclient/prune.lock" ]; then
+            echo "Besu rolling history expiry is applied at startup; skipping offline pre-merge prune"
+            rm -f /ethclient/prune.lock
+        fi
+
+        CMD="$PERF_PREFIX /opt/besu/bin/besu \
+            $BESU_NETWORK \
+            --data-path=/ethclient/besu \
+            --discovery-mode=BOTH \
+            --rpc-http-enabled \
+            --rpc-http-host=0.0.0.0 \
+            --rpc-http-port=${EC_HTTP_PORT:-8545} \
+            --rpc-ws-enabled \
+            --rpc-ws-host=0.0.0.0 \
+            --rpc-ws-port=${EC_WS_PORT:-8546} \
+            --host-allowlist=* \
+            --rpc-http-max-active-connections=1024 \
+            --nat-method=docker \
+            --engine-rpc-enabled \
+            --engine-rpc-port=${EC_ENGINE_PORT:-8551} \
+            --engine-host-allowlist=* \
+            --engine-jwt-secret=/secrets/jwtsecret \
+            $EC_ADDITIONAL_FLAGS"
+
+        if [ ! -z "$EXTERNAL_IP" ]; then
+            CMD="$CMD --p2p-host=$EXTERNAL_IP"
+        fi
+
+        if [ "$ENABLE_IPV6" = "true" ]; then
+            CMD="$CMD --p2p-ipv6-outbound-enabled --p2p-interface-ipv6=::"
+            if [ ! -z "$EC_P2P_PORT" ]; then
+                CMD="$CMD --p2p-port-ipv6=$EC_P2P_PORT"
+            fi
+            if [ ! -z "$EXTERNAL_IP6" ]; then
+                CMD="$CMD --p2p-host-ipv6=$EXTERNAL_IP6"
+            fi
+        fi
+
+        if [ ! -z "$EC_SUGGESTED_BLOCK_GAS_LIMIT" ]; then
+            CMD="$CMD --target-gas-limit=$EC_SUGGESTED_BLOCK_GAS_LIMIT"
+        fi
+        
+        if [ "$EC_PRUNING_MODE" = "archive" ]; then
+            CMD="$CMD --sync-mode=FULL --data-storage-format=FOREST"
+        else
+            CMD="$CMD --Xbonsai-full-flat-db-enabled=true"
+        fi
+
+        if [ "$EC_PRUNING_MODE" = "fullNode" ]; then
+            CMD="$CMD --snapsync-server-enabled"
+        fi
+
+        if [ "$EC_PRUNING_MODE" = "rollingHistoryExpiry" ]; then
+            CMD="$CMD --snapsync-server-enabled --Xchain-pruning-enabled=ALL --Xchain-pruning-blocks-retained=2628000"
+        fi
+
+        if [ ! -z "$ETHSTATS_LABEL" ] && [ ! -z "$ETHSTATS_LOGIN" ]; then
+            CMD="$CMD --ethstats $ETHSTATS_LABEL:$ETHSTATS_LOGIN"
+        fi
+
+        if [ ! -z "$EC_MAX_PEERS" ]; then
+            CMD="$CMD --max-peers=$EC_MAX_PEERS"
+        fi
+
+        if [ "$ENABLE_METRICS" = "true" ]; then
+            CMD="$CMD --metrics-enabled --metrics-host=0.0.0.0 --metrics-port=$EC_METRICS_PORT"
+        fi
+
+        if [ ! -z "$EC_P2P_PORT" ]; then
+            CMD="$CMD --p2p-port=$EC_P2P_PORT"
+        fi
+
+        if [ "$EC_PRUNING_MODE" != "archive" ] && [ ! -z "$BESU_MAX_BACK_LAYERS" ]; then
+            CMD="$CMD --bonsai-historical-block-limit=$BESU_MAX_BACK_LAYERS"
+        fi
+
+        if [ "$BESU_JVM_HEAP_SIZE" -gt "0" ]; then
+            CMD="env JAVA_OPTS=\"-Xmx${BESU_JVM_HEAP_SIZE}m\" $CMD"
+        fi
+
+        exec ${CMD}
+    fi
+fi
+
+# Reth startup
+if [ "$CLIENT" = "reth" ]; then
+
+    # Create the JWT secret
+    # Use -s so a zero-byte leftover is repaired on restart.
+    if [ ! -s "/secrets/jwtsecret" ]; then
+        echo -n "$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d '[:space:]')" > /secrets/jwtsecret
+    fi
+
+    RETH_DATADIR="/ethclient/reth"
+
+    # Use official snapshots for mainnet when no db exists
+    if [ "$BEACON_NETWORK" = "mainnet" ] && [ "$EC_PRUNING_MODE" = "rollingHistoryExpiry" ] && [ ! -f "$RETH_DATADIR/db/mdbx.dat" ]; then
+        echo "No Reth database found; downloading rolling-history snapshot"
+        if ! $PERF_PREFIX /usr/local/bin/reth download $RETH_NETWORK \
+            --datadir "$RETH_DATADIR" \
+            --with-txs-distance 2628000 \
+            --with-receipts-distance 2628000 \
+            --with-state-history-distance 10064 \
+            --with-rocksdb \
+            -y
+        then
+            echo "Reth snapshot download failed; removing partial data so the next start can retry"
+            rm -rf "$RETH_DATADIR/db" "$RETH_DATADIR/static_files" "$RETH_DATADIR/rocksdb" "$RETH_DATADIR/reth.toml"
+            exit 1
+        fi
+    fi
+
+    # Check for the prune flag and run that first if requested
+    if [ -f "/ethclient/prune.lock" ]; then
+        if [ "$EC_PRUNING_MODE" = "archive" ]; then
+            echo "Reth is an archive node. Not attempting to prune: Aborting."
+            rm -f /ethclient/prune.lock
+            exit 1
+        fi
+        $PERF_PREFIX /usr/local/bin/reth prune $RETH_NETWORK --datadir /ethclient/reth ; rm /ethclient/prune.lock
+    else
+
+    CMD="$PERF_PREFIX /usr/local/bin/reth node $RETH_NETWORK \
+        --datadir /ethclient/reth \
+        --http \
+        --http.addr 0.0.0.0 \
+        --http.port ${EC_HTTP_PORT:-8545} \
+        --http.api eth,net,web3 \
+        --http.corsdomain=* \
+        --ws \
+        --ws.addr 0.0.0.0 \
+        --ws.port ${EC_WS_PORT:-8546} \
+        --ws.api eth,net,web3 \
+        --ws.origins=* \
+        --authrpc.addr 0.0.0.0 \
+        --authrpc.port ${EC_ENGINE_PORT:-8551} \
+        --authrpc.jwtsecret /secrets/jwtsecret \
+        $EC_ADDITIONAL_FLAGS"
+
+    if [ ! -z "$EC_SUGGESTED_BLOCK_GAS_LIMIT" ]; then
+            CMD="$CMD --builder.gaslimit $EC_SUGGESTED_BLOCK_GAS_LIMIT"
+    fi
+    
+    if [ "$ENABLE_METRICS" = "true" ]; then
+        CMD="$CMD --metrics 0.0.0.0:$EC_METRICS_PORT"
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "fullNode" ]; then
+        CMD="$CMD --block-interval 5"
+        CMD="$CMD --prune.receipts.before 0"
+        CMD="$CMD --prune.senderrecovery.full"
+        CMD="$CMD --prune.accounthistory.distance 10064"
+        CMD="$CMD --prune.storagehistory.distance 10064"
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "historyExpiry" ]; then
+        CMD="$CMD --block-interval 5"
+        CMD="$CMD --prune.senderrecovery.full"
+        CMD="$CMD --prune.accounthistory.distance 10064"
+        CMD="$CMD --prune.storagehistory.distance 10064"
+        CMD="$CMD --prune.bodies.pre-merge"
+        CMD="$CMD --prune.receipts.pre-merge"
+        CMD="$CMD --prune.transaction-lookup.distance=10064"
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "rollingHistoryExpiry" ]; then
+        CMD="$CMD --block-interval 5"
+        CMD="$CMD --prune.senderrecovery.full"
+        CMD="$CMD --prune.accounthistory.distance 10064"
+        CMD="$CMD --prune.storagehistory.distance 10064"
+        CMD="$CMD --prune.transaction-lookup.distance=10064"
+        CMD="$CMD --prune.bodies.distance 2628000"
+        CMD="$CMD --prune.receipts.distance 2628000"
+    fi
+
+    if [ ! -z "$EC_MAX_PEERS" ]; then
+        CMD="$CMD --max-outbound-peers=$EC_MAX_PEERS"
+    fi
+
+    if [ ! -z "$RETH_MAX_INBOUND_PEERS" ]; then
+        CMD="$CMD --max-inbound-peers=$RETH_MAX_INBOUND_PEERS"
+    fi
+
+    RETH_P2P_PORT=${EC_P2P_PORT:-30303}
+    CMD="$CMD --port $RETH_P2P_PORT --discovery.port $RETH_P2P_PORT --discovery.v5.port $RETH_P2P_PORT"
+
+    if [ "$ENABLE_IPV6" = "true" ]; then
+        CMD="$CMD --addr :: --discovery.v5.port.ipv6 $RETH_P2P_PORT"
+    fi
+
+    exec ${CMD}
+
+    fi
+fi
+
+# Erigon startup
+if [ "$CLIENT" = "erigon" ]; then
+
+    # Performance tuning for ARM systems
+    UNAME_VAL=$(uname -m)
+    if [ "$UNAME_VAL" = "arm64" ] || [ "$UNAME_VAL" = "aarch64" ]; then
+        if command -v taskset >/dev/null 2>&1 && command -v ionice >/dev/null 2>&1; then
+            define_perf_prefix
+        else
+            echo "taskset/ionice not available; skipping ARM performance tuning"
+        fi
+    fi
+
+    # Create the JWT secret
+    # Use -s so a zero-byte leftover is repaired on restart.
+    if [ ! -s "/secrets/jwtsecret" ]; then
+        echo -n "$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d '[:space:]')" > /secrets/jwtsecret
+    fi
+
+    # Erigon prunes continuously from --prune.mode; there is no offline prune step.
+    if [ -f "/ethclient/prune.lock" ]; then
+        echo "Erigon pruning is applied at startup; skipping offline prune"
+        echo "Changing prune mode requires a resync (rocketpool service resync-eth1)"
+        rm -f /ethclient/prune.lock
+    fi
+
+    CMD="$PERF_PREFIX /usr/local/bin/erigon $ERIGON_NETWORK \
+        --datadir /ethclient/erigon \
+        --externalcl \
+        --mcp.disable \
+        --http \
+        --http.addr 0.0.0.0 \
+        --http.port ${EC_HTTP_PORT:-8545} \
+        --http.api eth,net,web3 \
+        --http.corsdomain=* \
+        --http.vhosts=* \
+        --ws \
+        --ws.port ${EC_WS_PORT:-8546} \
+        --authrpc.addr 0.0.0.0 \
+        --authrpc.port ${EC_ENGINE_PORT:-8551} \
+        --authrpc.vhosts=* \
+        --authrpc.jwtsecret /secrets/jwtsecret \
+        --rpc.returndata.limit 1000000 \
+        $EC_ADDITIONAL_FLAGS"
+
+    if [ -n "$CUSTOM_CHAIN_DIR" ]; then
+        CMD="$CMD --bootnodes $BOOTNODE_ENODE_LIST"
+    fi
+
+    # Let Erigon refresh the public IP via STUN as it changes.
+    # Preserve an explicit NAT setting supplied in Additional Flags.
+    if ! printf '%s\n' "$EC_ADDITIONAL_FLAGS" | grep -Eq -- '(^|[[:space:]])--nat(=|[[:space:]]|$)'; then
+        CMD="$CMD --nat stun"
+    fi
+
+    if [ ! -z "$EC_SUGGESTED_BLOCK_GAS_LIMIT" ]; then
+        CMD="$CMD --miner.gaslimit $EC_SUGGESTED_BLOCK_GAS_LIMIT"
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "archive" ]; then
+        CMD="$CMD --prune.mode=archive"
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "fullNode" ]; then
+        CMD="$CMD --prune.mode=blocks --prune.include-receipts --prune.receipts.distance=keep-all"
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "historyExpiry" ]; then
+        echo "Erigon does not support pre-merge-only history expiry; keeping all remaining block history with full-mode state pruning"
+        CMD="$CMD --prune.mode=full --persist.receipts=false --prune.distance.blocks=18446744073709551615"
+    fi
+
+    if [ "$EC_PRUNING_MODE" = "rollingHistoryExpiry" ]; then
+        CMD="$CMD --prune.mode=full --persist.receipts=false --prune.distance=2628000 --prune.distance.blocks=2628000"
+    fi
+
+    if [ ! -z "$ETHSTATS_LABEL" ] && [ ! -z "$ETHSTATS_LOGIN" ]; then
+        CMD="$CMD --ethstats $ETHSTATS_LABEL:$ETHSTATS_LOGIN"
+    fi
+
+    if [ ! -z "$EC_MAX_PEERS" ]; then
+        CMD="$CMD --maxpeers $EC_MAX_PEERS"
+    fi
+
+    if [ "$ENABLE_METRICS" = "true" ]; then
+        CMD="$CMD --metrics --metrics.addr 0.0.0.0 --metrics.port $EC_METRICS_PORT"
+    fi
+
+    if [ ! -z "$EC_P2P_PORT" ]; then
+        CMD="$CMD --port $EC_P2P_PORT"
+    fi
+
+    if [ ! -z "$ERIGON_TORRENT_PORT" ]; then
+        CMD="$CMD --torrent.port $ERIGON_TORRENT_PORT"
+    fi
+
+    exec ${CMD}
+
+fi

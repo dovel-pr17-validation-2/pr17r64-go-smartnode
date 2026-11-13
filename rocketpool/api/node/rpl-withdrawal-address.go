@@ -1,0 +1,262 @@
+package node
+
+import (
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/rocket-pool/smartnode/bindings/node"
+	"github.com/rocket-pool/smartnode/bindings/storage"
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+	"github.com/rocket-pool/smartnode/shared/services"
+
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func canSetRPLWithdrawalAddress(c *cli.Command, withdrawalAddress common.Address, confirm bool) (*api.CanSetNodeRPLWithdrawalAddressResponse, error) {
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.CanSetNodeRPLWithdrawalAddressResponse{}
+
+	// Get transactor
+	opts, err := w.GetNodeAccountTransactor()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the node's account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Data
+	var wg errgroup.Group
+	var primaryWithdrawalAddress common.Address
+	var isRPLWithdrawalAddressSet bool
+	var rplWithdrawalAddress common.Address
+	var rplStake *big.Int
+
+	// Get the primary withdrawal address
+	wg.Go(func() error {
+		var err error
+		primaryWithdrawalAddress, err = storage.GetNodeWithdrawalAddress(rp, nodeAccount.Address, nil)
+		return err
+	})
+
+	// Check if the RPL withdrawal address is set
+	wg.Go(func() error {
+		var err error
+		isRPLWithdrawalAddressSet, err = node.GetNodeRPLWithdrawalAddressIsSet(rp, nodeAccount.Address, nil)
+		return err
+	})
+
+	// Get the RPL withdrawal address
+	wg.Go(func() error {
+		var err error
+		rplWithdrawalAddress, err = node.GetNodeRPLWithdrawalAddress(rp, nodeAccount.Address, nil)
+		return err
+	})
+
+	// Get the RPL stake amount
+	wg.Go(func() error {
+		var err error
+		rplStake, err = node.GetNodeStakedRPL(rp, nodeAccount.Address, nil)
+		return err
+	})
+	// Wait for data
+	if err := wg.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Check data
+	response.RPLStake = rplStake
+	response.PrimaryAddressDiffers = (nodeAccount.Address != primaryWithdrawalAddress || isRPLWithdrawalAddressSet)
+	response.RPLAddressDiffers = (isRPLWithdrawalAddressSet && nodeAccount.Address != rplWithdrawalAddress)
+	response.CanSet = !response.PrimaryAddressDiffers && !response.RPLAddressDiffers
+	if !response.CanSet {
+		return &response, nil
+	}
+
+	// Check withdrawal address setting
+	gasLimits, err := node.EstimateSetRPLWithdrawalAddressGas(rp, nodeAccount.Address, withdrawalAddress, confirm, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.GasLimits = gasLimits
+
+	// Return response
+	return &response, nil
+}
+
+func setRPLWithdrawalAddress(c *cli.Command, withdrawalAddress common.Address, confirm bool, t *snroute.TransactOpts) (*api.SetNodeRPLWithdrawalAddressResponse, error) {
+	opts := t.Opts()
+
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.SetNodeRPLWithdrawalAddressResponse{}
+
+	// Get the node's account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Set withdrawal address
+	hash, err := node.SetRPLWithdrawalAddress(rp, nodeAccount.Address, withdrawalAddress, confirm, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.TxHash = hash
+
+	// Return response
+	return &response, nil
+}
+
+func canConfirmRPLWithdrawalAddress(c *cli.Command) (*api.CanConfirmNodeRPLWithdrawalAddressResponse, error) {
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.CanConfirmNodeRPLWithdrawalAddressResponse{}
+
+	// Get transactor
+	opts, err := w.GetNodeAccountTransactor()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the node's account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Make sure the pending withdrawal address is set to the node address
+	pendingAddress, err := node.GetNodePendingRPLWithdrawalAddress(rp, nodeAccount.Address, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	response.CanConfirm = (pendingAddress != nodeAccount.Address)
+	if !response.CanConfirm {
+		return &response, nil
+	}
+
+	// Check withdrawal address setting
+	gasLimits, err := node.EstimateConfirmRPLWithdrawalAddressGas(rp, nodeAccount.Address, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.GasLimits = gasLimits
+
+	// Return response
+	return &response, nil
+}
+
+func confirmRPLWithdrawalAddress(c *cli.Command, t *snroute.TransactOpts) (*api.ConfirmNodeRPLWithdrawalAddressResponse, error) {
+	opts := t.Opts()
+
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.ConfirmNodeRPLWithdrawalAddressResponse{}
+
+	// Get the node's account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Set withdrawal address
+	hash, err := node.ConfirmRPLWithdrawalAddress(rp, nodeAccount.Address, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.TxHash = hash
+
+	// Return response
+	return &response, nil
+}
+
+func canSetRplWithdrawalAddressHandler(ctx snroute.Context) {
+	addr := common.HexToAddress(ctx.Request.URL.Query().Get("address"))
+	confirm := ctx.Request.URL.Query().Get("confirm") == "true"
+	resp, err := canSetRPLWithdrawalAddress(ctx.Command(), addr, confirm)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func setRplWithdrawalAddressHandler(ctx snroute.WriteContext) {
+	addr := common.HexToAddress(ctx.Request.FormValue("address"))
+	confirm := ctx.Request.FormValue("confirm") == "true"
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := setRPLWithdrawalAddress(ctx.Command(), addr, confirm, opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func canConfirmRplWithdrawalAddressHandler(ctx snroute.Context) {
+	resp, err := canConfirmRPLWithdrawalAddress(ctx.Command())
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func confirmRplWithdrawalAddressHandler(ctx snroute.WriteContext) {
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := confirmRPLWithdrawalAddress(ctx.Command(), opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}

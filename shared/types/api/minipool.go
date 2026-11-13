@@ -1,0 +1,352 @@
+package api
+
+import (
+	"math/big"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+
+	"github.com/rocket-pool/smartnode/bindings/minipool"
+	"github.com/rocket-pool/smartnode/bindings/tokens"
+	"github.com/rocket-pool/smartnode/bindings/transactions/gaslimit"
+	"github.com/rocket-pool/smartnode/bindings/types"
+	"github.com/rocket-pool/smartnode/shared/services/beacon"
+)
+
+type MinipoolStatusResponse struct {
+	APIResponse
+	Minipools      []MinipoolDetails `json:"minipools"`
+	LatestDelegate common.Address    `json:"latestDelegate"`
+}
+type MinipoolDetails struct {
+	Address               common.Address         `json:"address"`
+	ValidatorPubkey       types.ValidatorPubkey  `json:"validatorPubkey"`
+	Status                minipool.StatusDetails `json:"status"`
+	DepositType           types.MinipoolDeposit  `json:"depositType"`
+	Node                  minipool.NodeDetails   `json:"node"`
+	User                  minipool.UserDetails   `json:"user"`
+	Balances              tokens.Balances        `json:"balances"`
+	NodeShareOfETHBalance *big.Int               `json:"nodeShareOfETHBalance"`
+	Validator             ValidatorDetails       `json:"validator"`
+	CanStake              bool                   `json:"canStake"`
+	CanPromote            bool                   `json:"canPromote"`
+	Queue                 minipool.QueueDetails  `json:"queue"`
+	RefundAvailable       bool                   `json:"refundAvailable"`
+	WithdrawalAvailable   bool                   `json:"withdrawalAvailable"`
+	CloseAvailable        bool                   `json:"closeAvailable"`
+	Finalised             bool                   `json:"finalised"`
+	UseLatestDelegate     bool                   `json:"useLatestDelegate"`
+	Delegate              common.Address         `json:"delegate"`
+	PreviousDelegate      common.Address         `json:"previousDelegate"`
+	EffectiveDelegate     common.Address         `json:"effectiveDelegate"`
+	TimeUntilDissolve     time.Duration          `json:"timeUntilDissolve"`
+	DissolveTimeout       time.Duration          `json:"dissolveTimeout"`
+	Penalties             uint64                 `json:"penalties"`
+}
+type ValidatorDetails struct {
+	Exists      bool     `json:"exists"`
+	Active      bool     `json:"active"`
+	Index       string   `json:"index"`
+	Balance     *big.Int `json:"balance"`
+	NodeBalance *big.Int `json:"nodeBalance"`
+}
+type MinipoolBalanceDistributionDetails struct {
+	Address            common.Address       `json:"address"`
+	Balance            *big.Int             `json:"balance"`
+	Refund             *big.Int             `json:"refund"`
+	NodeShareOfBalance *big.Int             `json:"nodeShareOfBalance"`
+	MinipoolVersion    uint8                `json:"minipoolVersion"`
+	Status             types.MinipoolStatus `json:"status"`
+	IsFinalized        bool                 `json:"isFinalized"`
+	CanDistribute      bool                 `json:"canDistribute"`
+	GasLimits          gaslimit.Limits      `json:"gasLimits"`
+}
+
+type CanRefundMinipoolResponse struct {
+	APIResponse
+	CanRefund                 bool            `json:"canRefund"`
+	InsufficientRefundBalance bool            `json:"insufficientRefundBalance"`
+	GasLimits                 gaslimit.Limits `json:"gasLimits"`
+}
+type RefundMinipoolResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanDissolveMinipoolResponse struct {
+	APIResponse
+	CanDissolve   bool            `json:"canDissolve"`
+	InvalidStatus bool            `json:"invalidStatus"`
+	GasLimits     gaslimit.Limits `json:"gasLimits"`
+}
+type DissolveMinipoolResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanExitMinipoolResponse struct {
+	APIResponse
+	CanExit       bool `json:"canExit"`
+	InvalidStatus bool `json:"invalidStatus"`
+}
+type ExitMinipoolResponse struct {
+	APIResponse
+}
+
+type CanChangeWithdrawalCredentialsResponse struct {
+	APIResponse
+	CanChange bool `json:"canChange"`
+}
+type ChangeWithdrawalCredentialsResponse struct {
+	APIResponse
+}
+
+type ImportKeyResponse struct {
+	APIResponse
+}
+
+type CanProcessWithdrawalResponse struct {
+	APIResponse
+	CanWithdraw   bool            `json:"canWithdraw"`
+	InvalidStatus bool            `json:"invalidStatus"`
+	GasLimits     gaslimit.Limits `json:"gasLimits"`
+}
+type ProcessWithdrawalResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanProcessWithdrawalAndFinaliseResponse struct {
+	APIResponse
+	CanWithdraw   bool            `json:"canWithdraw"`
+	InvalidStatus bool            `json:"invalidStatus"`
+	GasLimits     gaslimit.Limits `json:"gasLimits"`
+}
+type ProcessWithdrawalAndFinaliseResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type MinipoolCloseDetails struct {
+	Address            common.Address        `json:"address"`
+	IsFinalized        bool                  `json:"isFinalized"`
+	MinipoolStatus     types.MinipoolStatus  `json:"minipoolStatus"`
+	MinipoolVersion    uint8                 `json:"minipoolVersion"`
+	Distributed        bool                  `json:"distributed"`
+	CanClose           bool                  `json:"canClose"`
+	Balance            *big.Int              `json:"balance"`
+	Refund             *big.Int              `json:"refund"`
+	UserDepositBalance *big.Int              `json:"userDepositBalance"`
+	BeaconState        beacon.ValidatorState `json:"beaconState"`
+	NodeShare          *big.Int              `json:"nodeShare"`
+	GasLimits          gaslimit.Limits       `json:"gasLimits"`
+}
+
+type GetMinipoolCloseDetailsForNodeResponse struct {
+	APIResponse
+	ExpressTicketsProvisioned   bool                   `json:"expressTicketsProvisioned"`
+	IsFeeDistributorInitialized bool                   `json:"isFeeDistributorInitialized"`
+	Details                     []MinipoolCloseDetails `json:"details"`
+}
+type CloseMinipoolResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type GetDistributeBalanceDetailsResponse struct {
+	APIResponse
+	Details []MinipoolBalanceDistributionDetails `json:"details"`
+}
+type CanDistributeBalanceResponse struct {
+	APIResponse
+	MinipoolVersion uint8                `json:"minipoolVersion"`
+	MinipoolStatus  types.MinipoolStatus `json:"minipoolStatus"`
+	Balance         *big.Int             `json:"balance"`
+	CanDistribute   bool                 `json:"canDistribute"`
+	GasLimits       gaslimit.Limits      `json:"gasLimits"`
+}
+type EstimateDistributeBalanceGasResponse struct {
+	APIResponse
+	GasLimits gaslimit.Limits `json:"gasLimits"`
+}
+type DistributeBalanceResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanFinaliseMinipoolResponse struct {
+	APIResponse
+	GasLimits gaslimit.Limits `json:"gasLimits"`
+}
+type FinaliseMinipoolResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanDelegateUpgradeResponse struct {
+	APIResponse
+	LatestDelegateAddress common.Address  `json:"latestDelegateAddress"`
+	GasLimits             gaslimit.Limits `json:"gasLimits"`
+}
+type DelegateUpgradeResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanSetUseLatestDelegateResponse struct {
+	APIResponse
+	GasLimits gaslimit.Limits `json:"gasLimits"`
+}
+type SetUseLatestDelegateResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanStakeMinipoolResponse struct {
+	APIResponse
+	CanStake  bool            `json:"canStake"`
+	GasLimits gaslimit.Limits `json:"gasLimits"`
+}
+type StakeMinipoolResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanPromoteMinipoolResponse struct {
+	APIResponse
+	CanPromote bool            `json:"canPromote"`
+	GasLimits  gaslimit.Limits `json:"gasLimits"`
+}
+type PromoteMinipoolResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type GetUseLatestDelegateResponse struct {
+	APIResponse
+	Setting bool `json:"setting"`
+}
+
+type GetDelegateResponse struct {
+	APIResponse
+	Address common.Address `json:"address"`
+}
+
+type GetPreviousDelegateResponse struct {
+	APIResponse
+	Address common.Address `json:"address"`
+}
+
+type GetEffectiveDelegateResponse struct {
+	APIResponse
+	Address common.Address `json:"address"`
+}
+
+type GetVanityArtifactsResponse struct {
+	APIResponse
+	NodeAddress            common.Address `json:"nodeAddress"`
+	MinipoolFactoryAddress common.Address `json:"minipoolFactoryAddress"`
+	InitHash               common.Hash    `json:"initHash"`
+}
+
+type CanBeginReduceBondAmountResponse struct {
+	APIResponse
+	BondReductionDisabled bool                  `json:"bondReductionDisabled"`
+	MinipoolVersionTooLow bool                  `json:"minipoolVersionTooLow"`
+	Balance               uint64                `json:"balance"`
+	BalanceTooLow         bool                  `json:"balanceTooLow"`
+	BorrowRequest         *big.Int              `json:"borrowRequest"`
+	BeaconState           beacon.ValidatorState `json:"beaconState"`
+	InvalidBeaconState    bool                  `json:"invalidBeaconState"`
+	CanReduce             bool                  `json:"canReduce"`
+	GasLimits             gaslimit.Limits       `json:"gasLimits"`
+}
+type BeginReduceBondAmountResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanReduceBondAmountResponse struct {
+	APIResponse
+	MinipoolVersion uint8           `json:"minipoolVersion"`
+	CanReduce       bool            `json:"canReduce"`
+	GasLimits       gaslimit.Limits `json:"gasLimits"`
+}
+type ReduceBondAmountResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type MinipoolRescueDissolvedDetails struct {
+	Address         common.Address        `json:"address"`
+	CanRescue       bool                  `json:"canRescue"`
+	IsFinalized     bool                  `json:"isFinalized"`
+	MinipoolStatus  types.MinipoolStatus  `json:"minipoolStatus"`
+	MinipoolVersion uint8                 `json:"minipoolVersion"`
+	BeaconBalance   *big.Int              `json:"beaconBalance"`
+	BeaconState     beacon.ValidatorState `json:"beaconState"`
+	GasLimits       gaslimit.Limits       `json:"gasLimits"`
+}
+
+type GetMinipoolRescueDissolvedDetailsForNodeResponse struct {
+	APIResponse
+	Details []MinipoolRescueDissolvedDetails `json:"details"`
+}
+type RescueDissolvedMinipoolResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type GetBondReductionEnabledResponse struct {
+	APIResponse
+	BondReductionEnabled bool `json:"bondReductionEnabled"`
+}
+
+// VerifyPerformanceResponse reports the result of an RPIP-73 target-vote
+// performance check for a single validator over a range of epochs.
+type VerifyPerformanceResponse struct {
+	Status                  string                `json:"status"`
+	Error                   string                `json:"error"`
+	ValidatorPubkey         types.ValidatorPubkey `json:"validatorPubkey"`
+	ValidatorIndex          uint64                `json:"validatorIndex"`
+	StartEpoch              uint64                `json:"startEpoch"`
+	EndEpoch                uint64                `json:"endEpoch"`
+	TotalEpochs             uint64                `json:"totalEpochs"`
+	TimelyEpochs            uint64                `json:"timelyEpochs"`
+	MissedEpochs            uint64                `json:"missedEpochs"`
+	InactiveEpochs          uint64                `json:"inactiveEpochs"`
+	PerformancePct          float64               `json:"performancePct"`
+	PerformanceThresholdPct float64               `json:"performanceThresholdPct"`
+	PassesThreshold         bool                  `json:"passesThreshold"`
+	MissedEpochList         []uint64              `json:"missedEpochList"`
+	TimelyEpochList         []uint64              `json:"timelyEpochList"`
+	// Participation is challenge calldata (uint256[]): measured epochs as a
+	// bitset, 1 = missed target vote, padded to the configured challenge period.
+	Participation []*big.Int `json:"participation"`
+	// Challengeable reports whether this check could back an on-chain challenge:
+	// performance exits are enabled, the bitmap covers the configured performance period,
+	// it is recent enough to be within the proof buffer, and the validator's
+	// missed count meets ceil(period * (1 - performance_threshold)).
+	Challengeable bool `json:"challengeable"`
+}
+
+// VerifyPerformanceResult is one validator's entry in a batch verify-performance
+// response. Either MinipoolAddress (for minipools) or ValidatorId (for megapool
+// validators) identifies the target. Performance holds the result when the
+// check succeeded; Error is populated instead when that single target failed so
+// one bad target does not abort the rest of the batch.
+type VerifyPerformanceResult struct {
+	NodeAddress     common.Address             `json:"nodeAddress"`
+	MinipoolAddress common.Address             `json:"minipoolAddress"`
+	ValidatorId     uint32                     `json:"validatorId"`
+	Performance     *VerifyPerformanceResponse `json:"performance"`
+	Error           string                     `json:"error"`
+}
+
+// VerifyPerformanceBatchResponse reports RPIP-73 target-vote performance for one
+// or more validators verified in a single run.
+type VerifyPerformanceBatchResponse struct {
+	Status  string                    `json:"status"`
+	Error   string                    `json:"error"`
+	Results []VerifyPerformanceResult `json:"results"`
+}

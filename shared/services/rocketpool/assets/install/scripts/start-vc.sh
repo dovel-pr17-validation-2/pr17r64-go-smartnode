@@ -1,0 +1,401 @@
+#!/bin/sh
+# This script launches ETH2 validator clients for Rocket Pool's docker stack; only edit if you know what you're doing ;)
+
+GWW_GRAFFITI_FILE="/addons/gww/graffiti.txt"
+
+# Create the keymanager API token
+KEYMANAGER_TOKEN_FILE="/validators/keymanager-token.txt"
+if [ ! -s "$KEYMANAGER_TOKEN_FILE" ]; then
+    echo -n "$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d '[:space:]')" > "$KEYMANAGER_TOKEN_FILE"
+fi
+
+# Set up the network-based flags
+if [ -z "$BEACON_NETWORK" ]; then
+    echo "BEACON_NETWORK is not set"
+    exit 1
+fi
+LH_NETWORK="$BEACON_NETWORK"
+LODESTAR_NETWORK="$BEACON_NETWORK"
+PRYSM_NETWORK="--$BEACON_NETWORK"
+TEKU_NETWORK="$BEACON_NETWORK"
+
+# Report a missing fee recipient file
+if [ ! -f "/validators/$FEE_RECIPIENT_FILE" ]; then
+    echo "Fee recipient file not found, please wait for the rocketpool_node process to create one."
+    exit 1
+fi
+
+
+# Lighthouse startup
+if [ "$CC_CLIENT" = "lighthouse" ]; then
+
+    # Set up the CC + fallback string
+    CC_URL_STRING=$CC_API_ENDPOINT
+    if [ ! -z "$FALLBACK_CC_API_ENDPOINT" ]; then
+        CC_URL_STRING="$CC_API_ENDPOINT,$FALLBACK_CC_API_ENDPOINT"
+    fi
+
+    if [ -n "$CUSTOM_CHAIN_DIR" ]; then
+        CMD_LH_NETWORK="--testnet-dir $CUSTOM_CHAIN_DIR"
+    else
+        CMD_LH_NETWORK="--network $LH_NETWORK"
+    fi
+
+    CMD="/usr/local/bin/lighthouse validator \
+        --network $LH_NETWORK \
+        --datadir /validators/lighthouse \
+        --init-slashing-protection \
+        --http \
+        --http-address 0.0.0.0 \
+        --http-port ${VC_KEYMANAGER_API_PORT:-5062} \
+        --http-token-path  $KEYMANAGER_TOKEN_FILE \
+        --unencrypted-http-transport \
+        --graffiti-append false \
+        --logfile-max-number 0 \
+        --beacon-nodes $CC_URL_STRING \
+        --suggested-fee-recipient $(cat /validators/$FEE_RECIPIENT_FILE) \
+        $VC_ADDITIONAL_FLAGS"
+
+    if [ ! -z "$VC_SUGGESTED_BLOCK_GAS_LIMIT" ]; then
+            CMD="$CMD --gas-limit $VC_SUGGESTED_BLOCK_GAS_LIMIT"
+    fi
+
+    if [ "$DOPPELGANGER_DETECTION" = "true" ]; then
+        CMD="$CMD --enable-doppelganger-protection"
+    fi
+
+    if [ "$ENABLE_PBS" = "true" ]; then
+        CMD="$CMD --builder-proposals"
+        if [ "$BEACON_NETWORK" != "hoodi" ]; then
+            if [ ! -z "$EPBS_BUILDER_BOOST_FACTOR" ]; then
+                CMD="$CMD --builder-boost-factor $EPBS_BUILDER_BOOST_FACTOR"
+            else
+                CMD="$CMD --prefer-builder-proposals"
+            fi
+        elif [ -z "$EPBS_BUILDER_BOOST_FACTOR" ]; then
+            CMD="$CMD --prefer-builder-proposals"
+        fi
+    fi
+
+    if [ "$ENABLE_METRICS" = "true" ]; then
+        CMD="$CMD --metrics --metrics-address 0.0.0.0 --metrics-port $VC_METRICS_PORT"
+    fi
+
+    if [ "$ENABLE_BITFLY_NODE_METRICS" = "true" ]; then
+        CMD="$CMD --monitoring-endpoint $BITFLY_NODE_METRICS_ENDPOINT?apikey=$BITFLY_NODE_METRICS_SECRET&machine=$BITFLY_NODE_METRICS_MACHINE_NAME"
+    fi
+
+    # Set up the Hoodi ePBS builder flags (amounts are in integer Gwei)
+    if [ "$BEACON_NETWORK" = "hoodi" ]; then
+        if [ ! -z "$EPBS_BUILDER_URLS" ]; then
+            CMD="$CMD --builder-urls $EPBS_BUILDER_URLS"
+            # Lighthouse requires builder URLs when setting the execution payment cap.
+            if [ ! -z "$EPBS_MAX_EXECUTION_PAYMENT_GWEI" ]; then
+                CMD="$CMD --builder-max-execution-payment $EPBS_MAX_EXECUTION_PAYMENT_GWEI"
+            fi
+        fi
+        if [ ! -z "$EPBS_MIN_BID_GWEI" ]; then
+            CMD="$CMD --builder-min-bid $EPBS_MIN_BID_GWEI"
+        fi
+        if [ ! -z "$EPBS_BUILDER_BOOST_FACTOR" ]; then
+            CMD="$CMD --builder-boost-factor $EPBS_BUILDER_BOOST_FACTOR"
+        fi
+    fi
+
+    if [ "$ADDON_GWW_ENABLED" = "true" ]; then
+        echo "default: $GRAFFITI" > $GWW_GRAFFITI_FILE # Default graffiti value for Lighthouse
+        exec ${CMD} --graffiti-file $GWW_GRAFFITI_FILE
+    else
+        exec ${CMD} --graffiti "$GRAFFITI"
+    fi
+
+fi
+
+# Lodestar startup
+if [ "$CC_CLIENT" = "lodestar" ]; then
+
+    # Remove any lock files that were left over accidentally after an unclean shutdown
+    find /validators/lodestar/validators -name voting-keystore.json.lock -delete
+
+    # Set up the CC + fallback string
+    CC_URL_STRING=$CC_API_ENDPOINT
+    if [ ! -z "$FALLBACK_CC_API_ENDPOINT" ]; then
+        CC_URL_STRING="$CC_API_ENDPOINT,$FALLBACK_CC_API_ENDPOINT"
+    fi
+
+    if [ -n "$CUSTOM_CHAIN_DIR" ]; then
+        CMD_NETWORK="--paramsFile $CUSTOM_CHAIN_DIR/config.yaml"
+    else
+        CMD_NETWORK="--network $LODESTAR_NETWORK"
+    fi
+
+    CMD="/usr/app/node_modules/.bin/lodestar validator \
+        --network $LODESTAR_NETWORK \
+        --dataDir /validators/lodestar \
+        --beacon-nodes $CC_URL_STRING \
+        $FALLBACK_CC_STRING \
+        --keystoresDir /validators/lodestar/validators \
+        --secretsDir /validators/lodestar/secrets \
+        --suggestedFeeRecipient $(cat /validators/$FEE_RECIPIENT_FILE) \
+        --keymanager true \
+        --keymanager.port ${VC_KEYMANAGER_API_PORT:-5062} \
+        --keymanager.address 0.0.0.0 \
+        --keymanager.tokenFile $KEYMANAGER_TOKEN_FILE \
+        $VC_ADDITIONAL_FLAGS"
+
+if [ ! -z "$VC_SUGGESTED_BLOCK_GAS_LIMIT" ]; then
+            CMD="$CMD --defaultGasLimit $VC_SUGGESTED_BLOCK_GAS_LIMIT"
+    fi
+
+    if [ "$DOPPELGANGER_DETECTION" = "true" ]; then
+        CMD="$CMD --doppelgangerProtection"
+    fi
+
+    if [ "$ENABLE_PBS" = "true" ]; then
+        CMD="$CMD --builder"
+    fi
+
+    if [ "$ENABLE_METRICS" = "true" ]; then
+        CMD="$CMD --metrics --metrics.address 0.0.0.0 --metrics.port $VC_METRICS_PORT"
+    fi
+
+    if [ "$ENABLE_BITFLY_NODE_METRICS" = "true" ]; then
+        CMD="$CMD --monitoring.endpoint $BITFLY_NODE_METRICS_ENDPOINT?apikey=$BITFLY_NODE_METRICS_SECRET&machine=$BITFLY_NODE_METRICS_MACHINE_NAME"
+    fi
+
+    # Set up the ePBS builder flags (amounts are in integer Gwei)
+    if [ ! -z "$EPBS_BUILDER_URLS" ]; then
+        CMD="$CMD --builder.urls $EPBS_BUILDER_URLS"
+    fi
+    if [ ! -z "$EPBS_MIN_BID_GWEI" ]; then
+        CMD="$CMD --builder.minBid $EPBS_MIN_BID_GWEI"
+    fi
+    if [ ! -z "$EPBS_MAX_EXECUTION_PAYMENT_GWEI" ]; then
+        CMD="$CMD --builder.maxExecutionPayment $EPBS_MAX_EXECUTION_PAYMENT_GWEI"
+        # Compare as text: a uint64 Gwei amount can exceed shell integer limits.
+        if [ "$EPBS_MAX_EXECUTION_PAYMENT_GWEI" != "0" ]; then
+            CMD="$CMD --allowDangerousTrustedPayments"
+        fi
+    fi
+    if [ ! -z "$EPBS_BUILDER_BOOST_FACTOR" ]; then
+        CMD="$CMD --builder.selection maxprofit --builder.boostFactor $EPBS_BUILDER_BOOST_FACTOR"
+    fi
+
+    exec ${CMD} --graffiti "$GRAFFITI"
+
+fi
+
+
+# Nimbus startup
+if [ "$CC_CLIENT" = "nimbus" ]; then
+
+    # Nimbus won't start unless the validator directories already exist
+    mkdir -p /validators/nimbus/validators
+    mkdir -p /validators/nimbus/secrets
+
+    # Set up the fallback arg
+    if [ ! -z "$FALLBACK_CC_API_ENDPOINT" ]; then
+        FALLBACK_CC_ARG="--beacon-node=$FALLBACK_CC_API_ENDPOINT"
+    fi
+
+    CMD="/home/user/nimbus_validator_client \
+        --non-interactive \
+        --beacon-node=$CC_API_ENDPOINT $FALLBACK_CC_ARG \
+        --data-dir=/ethclient/nimbus_vc \
+        --validators-dir=/validators/nimbus/validators \
+        --secrets-dir=/validators/nimbus/secrets \
+        --keymanager \
+        --keymanager-port=${VC_KEYMANAGER_API_PORT:-5062} \
+        --keymanager-address=0.0.0.0 \
+        --keymanager-token-file=$KEYMANAGER_TOKEN_FILE \
+        --doppelganger-detection=$DOPPELGANGER_DETECTION \
+        --suggested-fee-recipient=$(cat /validators/$FEE_RECIPIENT_FILE) \
+        --block-monitor-type=event \
+        $VC_ADDITIONAL_FLAGS"
+
+    if [ "$ENABLE_PBS" = "true" ] || [ ! -z "$EPBS_BUILDER_URLS" ]; then
+        CMD="$CMD --payload-builder"
+    fi
+
+    if [ "$ENABLE_METRICS" = "true" ]; then
+        CMD="$CMD --metrics --metrics-address=0.0.0.0 --metrics-port=$VC_METRICS_PORT"
+    fi
+
+    # Set up the ePBS builder flags (amounts are in integer Gwei)
+    if [ ! -z "$EPBS_BUILDER_URLS" ]; then
+        BUILDER_URLS=$(printf '%s' "$EPBS_BUILDER_URLS" | tr ',' ' ')
+        for BUILDER_URL in $BUILDER_URLS; do
+            CMD="$CMD --payload-builder-url=$BUILDER_URL"
+        done
+        case "$EPBS_BUILDER_URLS" in
+            *,*) echo "WARNING: Nimbus v26.10.1 uses only the last --payload-builder-url when multiple builders are configured." ;;
+        esac
+    fi
+    if [ ! -z "$EPBS_MIN_BID_GWEI" ]; then
+        CMD="$CMD --builder-min-bid=$EPBS_MIN_BID_GWEI"
+    fi
+    if [ ! -z "$EPBS_MAX_EXECUTION_PAYMENT_GWEI" ]; then
+        CMD="$CMD --builder-max-execution-payment=$EPBS_MAX_EXECUTION_PAYMENT_GWEI"
+    fi
+    if [ ! -z "$EPBS_BUILDER_BOOST_FACTOR" ]; then
+        CMD="$CMD --builder-boost-factor=$EPBS_BUILDER_BOOST_FACTOR"
+    fi
+
+    # Graffiti breaks if it's in the CMD string instead of here because of spaces
+    exec ${CMD} --graffiti="$GRAFFITI"
+
+fi
+
+
+# Prysm startup
+if [ "$CC_CLIENT" = "prysm" ]; then
+
+    # Make the Prysm dir
+    mkdir -p /validators/prysm-non-hd/
+
+    # Set up the CC + fallback string
+    CC_URL_STRING=$CC_RPC_ENDPOINT
+    if [ ! -z "$FALLBACK_CC_RPC_ENDPOINT" ]; then
+        CC_URL_STRING="$CC_RPC_ENDPOINT,$FALLBACK_CC_RPC_ENDPOINT"
+    fi
+
+    if [ -n "$CUSTOM_CHAIN_DIR" ]; then
+        CMD_NETWORK="--config-file=$CUSTOM_CHAIN_DIR/config.yaml"
+    else
+        CMD_NETWORK="$PRYSM_NETWORK"
+    fi
+
+    CMD="/app/cmd/validator/validator \
+        --accept-terms-of-use \
+        $PRYSM_NETWORK \
+        --datadir /validators/prysm-non-hd/direct \
+        --wallet-dir /validators/prysm-non-hd \
+        --rpc \
+        --http-host 0.0.0.0 \
+        --http-port ${VC_KEYMANAGER_API_PORT:-5062} \
+        --keymanager-token-file $KEYMANAGER_TOKEN_FILE \
+        --wallet-password-file /validators/prysm-non-hd/direct/accounts/secret \
+        --beacon-rpc-provider $CC_URL_STRING \
+        --suggested-fee-recipient $(cat /validators/$FEE_RECIPIENT_FILE) \
+        $VC_ADDITIONAL_FLAGS"
+
+    if [ ! -z "$VC_SUGGESTED_BLOCK_GAS_LIMIT" ]; then
+        CMD="$CMD --suggested-gas-limit=$VC_SUGGESTED_BLOCK_GAS_LIMIT"
+    fi
+    
+    if [ "$ENABLE_PBS" = "true" ]; then
+        CMD="$CMD --enable-builder"
+    fi
+
+    if [ "$DOPPELGANGER_DETECTION" = "true" ]; then
+        CMD="$CMD --enable-doppelganger"
+    fi
+
+    if [ "$ENABLE_METRICS" = "true" ]; then
+        CMD="$CMD --monitoring-host 0.0.0.0 --monitoring-port $VC_METRICS_PORT"
+    else
+        CMD="$CMD --disable-monitoring --disable-account-metrics"
+    fi
+
+    if [ ! -z "$EPBS_BUILDER_URLS" ]; then
+        CMD="$CMD --builder-urls=$EPBS_BUILDER_URLS"
+    fi
+    if [ ! -z "$EPBS_MIN_BID_GWEI" ]; then
+        CMD="$CMD --builder-min-bid=$EPBS_MIN_BID_GWEI"
+    fi
+    if [ ! -z "$EPBS_MAX_EXECUTION_PAYMENT_GWEI" ]; then
+        CMD="$CMD --builder-max-execution-payment=$EPBS_MAX_EXECUTION_PAYMENT_GWEI"
+    fi
+    if [ ! -z "$EPBS_BUILDER_BOOST_FACTOR" ]; then
+        CMD="$CMD --builder-boost-factor=$EPBS_BUILDER_BOOST_FACTOR"
+    fi
+
+    if [ "$ADDON_GWW_ENABLED" = "true" ]; then
+        echo "ordered:\n  - $GRAFFITI" > $GWW_GRAFFITI_FILE # Default graffiti value for Prysm
+        exec ${CMD} --graffiti-file=$GWW_GRAFFITI_FILE
+    else
+        exec ${CMD} --graffiti "$GRAFFITI"
+    fi
+
+fi
+
+
+# Teku startup
+if [ "$CC_CLIENT" = "teku" ]; then
+
+    # Teku won't start unless the validator directories already exist
+    mkdir -p /validators/teku/keys
+    mkdir -p /validators/teku/passwords
+
+    # Remove any lock files that were left over accidentally after an unclean shutdown
+    rm -f /validators/teku/keys/*.lock
+
+    # Set up the CC + fallback string
+    CC_URL_STRING=$CC_API_ENDPOINT
+    if [ ! -z "$FALLBACK_CC_API_ENDPOINT" ]; then
+        CC_URL_STRING="$CC_API_ENDPOINT,$FALLBACK_CC_API_ENDPOINT"
+    fi
+
+    CMD="/opt/teku/bin/teku validator-client \
+        --network=$TEKU_NETWORK \
+        --data-path=/validators/teku \
+        --validator-keys=/validators/teku/keys:/validators/teku/passwords \
+        --beacon-node-api-endpoints=$CC_URL_STRING \
+        --validators-keystore-locking-enabled=false \
+        --log-destination=CONSOLE \
+        --validator-api-enabled=true \
+        --validator-api-port=${VC_KEYMANAGER_API_PORT:-5062} \
+        --validator-api-interface=0.0.0.0 \
+        --validator-api-host-allowlist=* \
+        --validator-api-bearer-file=$KEYMANAGER_TOKEN_FILE \
+        --Xvalidator-api-ssl-enabled=false \
+        --Xvalidator-api-unsafe-hosts-enabled=true \
+        --validators-proposer-default-fee-recipient=$(cat /validators/$FEE_RECIPIENT_FILE) \
+        $VC_ADDITIONAL_FLAGS"
+
+    if [ "$DOPPELGANGER_DETECTION" = "true" ]; then
+        CMD="$CMD --doppelganger-detection-enabled"
+    fi
+
+    if [ "$ENABLE_PBS" = "true" ]; then
+        CMD="$CMD --validators-builder-registration-default-enabled=true"
+        if [ ! -z "$BN_SUGGESTED_BLOCK_GAS_LIMIT" ]; then
+            CMD="$CMD --validators-builder-registration-default-gas-limit=$BN_SUGGESTED_BLOCK_GAS_LIMIT"
+        fi
+    fi
+
+    if [ "$TEKU_USE_SLASHING_PROTECTION" = "true" ]; then
+        CMD="$CMD --shut-down-when-validator-slashed-enabled=true"
+    fi
+
+    if [ "$ENABLE_METRICS" = "true" ]; then
+        CMD="$CMD --metrics-enabled=true --metrics-interface=0.0.0.0 --metrics-port=$VC_METRICS_PORT --metrics-host-allowlist=*"
+    fi
+
+    if [ "$ENABLE_BITFLY_NODE_METRICS" = "true" ]; then
+        CMD="$CMD --metrics-publish-endpoint=$BITFLY_NODE_METRICS_ENDPOINT?apikey=$BITFLY_NODE_METRICS_SECRET&machine=$BITFLY_NODE_METRICS_MACHINE_NAME"
+    fi
+
+    # Set up the ePBS builder flags (amounts are in integer Gwei)
+    if [ ! -z "$EPBS_BUILDER_URLS" ]; then
+        CMD="$CMD --Xbuilder-urls=$EPBS_BUILDER_URLS"
+    fi
+    if [ ! -z "$EPBS_MIN_BID_GWEI" ]; then
+        CMD="$CMD --Xbuilder-min-bid=$EPBS_MIN_BID_GWEI"
+    fi
+    if [ ! -z "$EPBS_MAX_EXECUTION_PAYMENT_GWEI" ]; then
+        CMD="$CMD --Xbuilder-max-execution-payment=$EPBS_MAX_EXECUTION_PAYMENT_GWEI"
+    fi
+    if [ ! -z "$EPBS_BUILDER_BOOST_FACTOR" ]; then
+        CMD="$CMD --Xbuilder-boost-factor=$EPBS_BUILDER_BOOST_FACTOR"
+    fi
+
+    if [ "$ADDON_GWW_ENABLED" = "true" ]; then
+        echo "$GRAFFITI" > $GWW_GRAFFITI_FILE # Default graffiti value for Teku
+        exec ${CMD} --validators-graffiti-file=$GWW_GRAFFITI_FILE
+    else
+        exec ${CMD} --validators-graffiti="$GRAFFITI"
+    fi
+
+fi
+

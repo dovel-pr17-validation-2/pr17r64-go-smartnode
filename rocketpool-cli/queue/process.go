@@ -1,0 +1,78 @@
+package queue
+
+import (
+	"fmt"
+	"strconv"
+
+	cliutils "github.com/rocket-pool/smartnode/rocketpool-cli/cli"
+	"github.com/rocket-pool/smartnode/rocketpool-cli/cli/prompt"
+	"github.com/rocket-pool/smartnode/shared/services/gas"
+	"github.com/rocket-pool/smartnode/shared/services/rocketpool"
+)
+
+func processQueue(yes bool) error {
+	// Get RP client
+	rp, err := rocketpool.NewClient().WithReady()
+	if err != nil {
+		return err
+	}
+	defer rp.Close()
+
+	var maxValidators uint64
+
+	queueLength, err := rp.GetQueueDetails()
+	if err != nil {
+		return err
+	}
+	if queueLength.TotalLength == 0 {
+		fmt.Println("There are no validators waiting to be processed")
+		return nil
+	}
+	maxValidatorsStr := prompt.Prompt(fmt.Sprintf("There is a total of %d validators in the queue. How many do you want to process?", queueLength.TotalLength), "^\\d+$", "Invalid number.")
+	maxValidators, err = strconv.ParseUint(maxValidatorsStr, 0, 64)
+	if err != nil {
+		return fmt.Errorf("'%s' is not a valid number: %w.\n", maxValidatorsStr, err)
+	}
+
+	// Check deposit queue can be processed
+	canProcess, err := rp.CanProcessQueue(uint32(maxValidators))
+	if err != nil {
+		return err
+	}
+	if !canProcess.CanProcess {
+		fmt.Println("The deposit queue cannot be processed:")
+		if canProcess.AssignDepositsDisabled {
+			fmt.Println("Deposit assignments are currently disabled.")
+		}
+		return nil
+	}
+
+	// Assign max fees
+	err = gas.AssignMaxFeeAndLimit(canProcess.GasLimits, rp, yes)
+	if err != nil {
+		return err
+	}
+
+	// Prompt for confirmation
+	if prompt.Declined(yes, "Do you accept this gas fee?") {
+		fmt.Println("Cancelled.")
+		return nil
+	}
+
+	// Process deposit queue
+	response, err := rp.ProcessQueue(uint32(maxValidators))
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Processing queue...\n")
+	cliutils.PrintTransactionHash(rp, response.TxHash)
+	if _, err = rp.WaitForTransaction(response.TxHash); err != nil {
+		return err
+	}
+
+	// Log & return
+	fmt.Println("The deposit queue was successfully processed.")
+	return nil
+
+}

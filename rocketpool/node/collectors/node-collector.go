@@ -1,0 +1,992 @@
+package collectors
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"math/big"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/rocket-pool/smartnode/bindings/deposit"
+	"github.com/rocket-pool/smartnode/bindings/megapool"
+	"github.com/rocket-pool/smartnode/bindings/rocketpool"
+	"github.com/rocket-pool/smartnode/bindings/types"
+	"github.com/rocket-pool/smartnode/shared/math"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/services/config"
+	rprewards "github.com/rocket-pool/smartnode/shared/services/rewards"
+)
+
+// Represents the collector for the user's node
+type NodeCollector struct {
+	// The total amount of RPL staked on the node
+	nodeLegacyStakedRpl *prometheus.Desc
+
+	// The total amount of RPL staked on megapool on the node
+	megapoolStakedRpl *prometheus.Desc
+
+	// The effective amount of RPL staked on the node
+	effectiveStakedRpl *prometheus.Desc
+
+	// The amount of staked RPL that will be eligible for rewards (0 if the node has no validators that count towards its borrowed ETH)
+	rewardableStakedRpl *prometheus.Desc
+
+	// The cumulative RPL rewards earned by the node
+	cumulativeRplRewards *prometheus.Desc
+
+	// The expected RPL rewards for the node at the next rewards checkpoint
+	expectedRplRewards *prometheus.Desc
+
+	// The estimated APR of RPL for the node from the next rewards checkpoint
+	rplApr *prometheus.Desc
+
+	// The token balances of your node wallet
+	balances *prometheus.Desc
+
+	// The number of active minipools owned by the node
+	activeMinipoolCount *prometheus.Desc
+
+	// The count of this node's minipools, broken down by status
+	minipoolStatusCount *prometheus.Desc
+
+	// The amount of ETH this node deposited into minipools
+	depositedEth *prometheus.Desc
+
+	// The node's total share of its minipool's beacon chain balances
+	minipoolBeaconShare *prometheus.Desc
+
+	// The total balances of all this node's validators on the beacon chain
+	minipoolBeaconBalance *prometheus.Desc
+
+	// The sync progress of the clients
+	clientSyncProgress *prometheus.Desc
+
+	// The total EL balance of all minipools belonging to this node
+	minipoolBalance *prometheus.Desc
+
+	// The node's share of the total minipool EL balance
+	minipoolShare *prometheus.Desc
+
+	// The amount of ETH waiting to be refunded for all minipools
+	minipoolRefundBalance *prometheus.Desc
+
+	// The RPL rewards from the last period that have not been claimed yet
+	unclaimedRewards *prometheus.Desc
+
+	// The claimed ETH rewards from the smoothing pool
+	claimedEthRewards *prometheus.Desc
+
+	// The unclaimed ETH rewards from the smoothing pool
+	unclaimedEthRewards *prometheus.Desc
+
+	// The collateral ratio with respect to the amount of borrowed ETH
+	borrowedCollateralRatio *prometheus.Desc
+
+	// The collateral ratio with respect to the amount of bonded ETH
+	bondedCollateralRatio *prometheus.Desc
+
+	// The low ETH balance threshold
+	lowETHBalanceThreshold *prometheus.Desc
+
+	// The Rocket Pool contract manager
+	rp *rocketpool.RocketPool
+
+	// The beacon client
+	bc *services.BeaconClientManager
+
+	// The execution client
+	ec *services.ExecutionClientManager
+
+	// The node's address
+	nodeAddress common.Address
+
+	// The event log interval for the current eth1 client
+	eventLogInterval *big.Int
+
+	// The next block to start from when looking at cumulative RPL rewards
+	nextRewardsStartBlock *big.Int
+
+	// The cumulative amount of RPL earned
+	cumulativeRewards float64
+
+	// The claimed ETH rewards from SP
+	cumulativeClaimedEthRewards float64
+
+	// Megapool ETH balance
+	megapoolEthBalance *prometheus.Desc
+
+	// Node debt
+	nodeDebt *prometheus.Desc
+
+	// Megapool validator count
+	megapoolValidatorCount *prometheus.Desc
+
+	// The count of this node's megapool validators, broken down by status
+	megapoolStatusCount *prometheus.Desc
+
+	// Megapool node express ticket count
+	megapoolNodeExpressTicketCount *prometheus.Desc
+
+	// Megapool refund value
+	megapoolRefundValue *prometheus.Desc
+
+	// Megapool beacon balance
+	megapoolBeaconBalance *prometheus.Desc
+
+	// Megapool node share of beacon balance
+	megapoolNodeShareofBeaconBalance *prometheus.Desc
+
+	// Megapool node bond
+	megapoolNodeBond *prometheus.Desc
+
+	// Megapool user capital
+	megapoolUserCapital *prometheus.Desc
+
+	// Megapool assigned value
+	megapoolAssignedValue *prometheus.Desc
+
+	// Megapool queue bond
+	megapoolQueueBond *prometheus.Desc
+
+	// Megapool pending rewards
+	megapoolPendingRewards *prometheus.Desc
+
+	// Megapool active validator count
+	megapoolActiveValidatorCount *prometheus.Desc
+
+	// Megapool locked validator count
+	megapoolLockedValidatorCount *prometheus.Desc
+
+	// Megapool delegate expiry
+	megapoolDelegateExpiry *prometheus.Desc
+
+	// Megapool queue size
+	megapoolStandardQueueSize *prometheus.Desc
+
+	// Megapool express queue size
+	megapoolExpressQueueSize *prometheus.Desc
+
+	// Megapool RPL rewards
+	// Map of reward intervals that have already been processed
+	handledIntervals map[uint64]bool
+
+	// The Rocket Pool config
+	cfg *config.RocketPoolConfig
+
+	// The thread-safe locker for the network state
+	stateLocker *StateLocker
+
+	// Prefix for logging
+	logPrefix string
+}
+
+// Create a new NodeCollector instance
+func NewNodeCollector(rp *rocketpool.RocketPool, bc *services.BeaconClientManager, ec *services.ExecutionClientManager, nodeAddress common.Address, cfg *config.RocketPoolConfig, stateLocker *StateLocker) *NodeCollector {
+
+	// Get the event log interval
+	eventLogInterval, err := cfg.GetEventLogInterval()
+	if err != nil {
+		log.Printf("Error getting event log interval: %s\n", err.Error())
+		return nil
+	}
+
+	subsystem := "node"
+	return &NodeCollector{
+		nodeLegacyStakedRpl: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "total_staked_rpl"),
+			"The total amount of legacy RPL staked on the node",
+			nil, nil,
+		),
+		effectiveStakedRpl: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "effective_staked_rpl"),
+			"The effective amount of RPL staked on the node",
+			nil, nil,
+		),
+		rewardableStakedRpl: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "rewardable_staked_rpl"),
+			"The amount of staked RPL that will be eligible for rewards (0 if the node has no validators that count towards its borrowed ETH)",
+			nil, nil,
+		),
+		cumulativeRplRewards: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "cumulative_rpl_rewards"),
+			"The cumulative RPL rewards earned by the node",
+			nil, nil,
+		),
+		expectedRplRewards: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "expected_rpl_rewards"),
+			"The expected RPL rewards for the node at the next rewards checkpoint",
+			nil, nil,
+		),
+		rplApr: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "rpl_apr"),
+			"The estimated APR of RPL for the node from the next rewards checkpoint",
+			nil, nil,
+		),
+		balances: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "balance"),
+			"How much ETH is in this node wallet",
+			[]string{"Token"}, nil,
+		),
+		activeMinipoolCount: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "active_minipool_count"),
+			"The number of active minipools owned by the node",
+			nil, nil,
+		),
+		minipoolStatusCount: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "minipool_count"),
+			"The count of this node's minipools, broken down by status",
+			[]string{"status"}, nil,
+		),
+		depositedEth: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "deposited_eth"),
+			"The amount of ETH this node deposited into minipools",
+			nil, nil,
+		),
+		minipoolBeaconShare: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "beacon_share"),
+			"The node's total share of its minipool's beacon chain balances",
+			nil, nil,
+		),
+		minipoolBeaconBalance: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "beacon_balance"),
+			"The total balances of all this node's validators on the beacon chain",
+			nil, nil,
+		),
+		clientSyncProgress: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "sync_progress"),
+			"The sync progress of the beacon and execution clients",
+			[]string{"client"}, nil,
+		),
+		minipoolBalance: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "minipool_balance"),
+			"The total EL balance of all minipools belonging to this node",
+			nil, nil,
+		),
+		minipoolShare: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "minipool_share"),
+			"The node's share of the total minipool EL balance",
+			nil, nil,
+		),
+		minipoolRefundBalance: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "refund_balance"),
+			"The amount of ETH waiting to be refunded for all minipools",
+			nil, nil,
+		),
+		unclaimedRewards: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "unclaimed_rewards"),
+			"The RPL rewards from the last period that have not been claimed yet",
+			nil, nil,
+		),
+		claimedEthRewards: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "claimed_eth_rewards"),
+			"The claimed ETH rewards from the smoothing pool",
+			nil, nil,
+		),
+		unclaimedEthRewards: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "unclaimed_eth_rewards"),
+			"The unclaimed ETH rewards from the smoothing pool",
+			nil, nil,
+		),
+		borrowedCollateralRatio: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "borrowed_collateral_ratio"),
+			"The collateral ratio with respect to the amount of borrowed ETH",
+			nil, nil,
+		),
+		bondedCollateralRatio: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "bonded_collateral_ratio"),
+			"The collateral ratio with respect to the amount of bonded ETH",
+			nil, nil,
+		),
+		lowETHBalanceThreshold: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "low_eth_balance_threshold"),
+			"The low ETH balance threshold",
+			nil, nil,
+		),
+		megapoolBeaconBalance: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_beacon_balance"),
+			"The Megapool beacon balance",
+			nil, nil,
+		),
+		megapoolEthBalance: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_eth_balance"),
+			"The Megapool ETH balance",
+			nil, nil,
+		),
+		megapoolNodeShareofBeaconBalance: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_node_share_of_beacon_balance"),
+			"The Megapool node share of beacon balance",
+			nil, nil,
+		),
+		nodeDebt: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "node_debt"),
+			"The Node debt",
+			nil, nil,
+		),
+		megapoolValidatorCount: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_validator_count"),
+			"The Megapool validator count",
+			nil, nil,
+		),
+		megapoolStatusCount: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_count"),
+			"The count of this node's megapool validators, broken down by status",
+			[]string{"status"}, nil,
+		),
+		megapoolNodeExpressTicketCount: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_node_express_ticket_count"),
+			"The Megapool node express ticket count",
+			nil, nil,
+		),
+		megapoolQueueBond: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_queue_bond"),
+			"The Megapool queue bond",
+			nil, nil,
+		),
+		megapoolPendingRewards: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_pending_rewards"),
+			"The Megapool pending rewards",
+			[]string{"type"}, nil,
+		),
+		megapoolRefundValue: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_refund_value"),
+			"The Megapool refund value",
+			nil, nil,
+		),
+		megapoolNodeBond: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_node_bond"),
+			"The Megapool node bond",
+			nil, nil,
+		),
+		megapoolUserCapital: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_user_capital"),
+			"The Megapool user capital",
+			nil, nil,
+		),
+		megapoolAssignedValue: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_assigned_value"),
+			"The Megapool assigned value",
+			nil, nil,
+		),
+		megapoolActiveValidatorCount: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_active_validator_count"),
+			"The Megapool active validator count",
+			nil, nil,
+		),
+		megapoolLockedValidatorCount: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_locked_validator_count"),
+			"The Megapool locked validator count",
+			nil, nil,
+		),
+		megapoolDelegateExpiry: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_delegate_expiry"),
+			"The Megapool delegate expiry timestamp",
+			nil, nil,
+		),
+		megapoolStandardQueueSize: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_standard_queue_size"),
+			"The Megapool standard queue size",
+			nil, nil,
+		),
+		megapoolExpressQueueSize: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_express_queue_size"),
+			"The Megapool express queue size",
+			nil, nil,
+		),
+		megapoolStakedRpl: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "megapool_staked_rpl"),
+			"The total amount of RPL staked on megapool on the node",
+			nil, nil,
+		),
+		rp:               rp,
+		bc:               bc,
+		ec:               ec,
+		nodeAddress:      nodeAddress,
+		eventLogInterval: big.NewInt(int64(eventLogInterval)),
+		handledIntervals: map[uint64]bool{},
+		cfg:              cfg,
+		stateLocker:      stateLocker,
+		logPrefix:        "Node Collector",
+	}
+}
+
+// Write metric descriptions to the Prometheus channel
+func (collector *NodeCollector) Describe(channel chan<- *prometheus.Desc) {
+	channel <- collector.nodeLegacyStakedRpl
+	channel <- collector.megapoolStakedRpl
+	channel <- collector.effectiveStakedRpl
+	channel <- collector.rewardableStakedRpl
+	channel <- collector.cumulativeRplRewards
+	channel <- collector.expectedRplRewards
+	channel <- collector.rplApr
+	channel <- collector.balances
+	channel <- collector.activeMinipoolCount
+	channel <- collector.minipoolStatusCount
+	channel <- collector.depositedEth
+	channel <- collector.minipoolBeaconBalance
+	channel <- collector.minipoolBeaconShare
+	channel <- collector.clientSyncProgress
+	channel <- collector.minipoolBalance
+	channel <- collector.minipoolShare
+	channel <- collector.minipoolRefundBalance
+	channel <- collector.unclaimedRewards
+	channel <- collector.claimedEthRewards
+	channel <- collector.unclaimedEthRewards
+	channel <- collector.borrowedCollateralRatio
+	channel <- collector.bondedCollateralRatio
+	channel <- collector.lowETHBalanceThreshold
+	channel <- collector.megapoolEthBalance
+	channel <- collector.nodeDebt
+	channel <- collector.megapoolValidatorCount
+	channel <- collector.megapoolStatusCount
+	channel <- collector.megapoolNodeExpressTicketCount
+	channel <- collector.megapoolRefundValue
+	channel <- collector.megapoolPendingRewards
+	channel <- collector.megapoolNodeBond
+	channel <- collector.megapoolUserCapital
+	channel <- collector.megapoolAssignedValue
+	channel <- collector.megapoolActiveValidatorCount
+	channel <- collector.megapoolLockedValidatorCount
+	channel <- collector.megapoolDelegateExpiry
+	channel <- collector.megapoolStandardQueueSize
+	channel <- collector.megapoolExpressQueueSize
+	channel <- collector.megapoolQueueBond
+	channel <- collector.megapoolBeaconBalance
+	channel <- collector.megapoolNodeShareofBeaconBalance
+}
+
+// Collect the latest metric values and pass them to Prometheus
+func (collector *NodeCollector) Collect(channel chan<- prometheus.Metric) {
+	// Get the latest state
+	state := collector.stateLocker.GetState()
+	if state == nil {
+		return
+	}
+
+	nd := state.NodeDetailsByAddress[collector.nodeAddress]
+	minipools := state.MinipoolDetailsByNode[collector.nodeAddress]
+
+	// MegapoolDetails and MegapoolToPubkeysMap are keyed by megapool contract address, not node address
+	megapoolAddress := nd.MegapoolAddress
+	megapoolDetails := state.MegapoolDetails[megapoolAddress]
+
+	// Sync
+	var wg errgroup.Group
+	nodeLegacyStakedRpl := math.WeiToEth(nd.LegacyStakedRPL)
+	nodeMegapoolStakedRpl := math.WeiToEth(nd.MegapoolStakedRPL)
+	effectiveStakedRpl := math.WeiToEth(nd.EffectiveRPLStake)
+	megapoolQueueBond := math.WeiToEth(megapoolDetails.NodeQueuedBond)
+	rewardsInterval := state.NetworkDetails.IntervalDuration
+	inflationInterval := state.NetworkDetails.RPLInflationIntervalRate
+	totalRplSupply := state.NetworkDetails.RPLTotalSupply
+	nodeOperatorRewardsPercent := math.WeiToEth(state.NetworkDetails.NodeOperatorRewardsPercent)
+	previousIntervalTotalNodeWeight := big.NewInt(0)
+	ethBalance := math.WeiToEth(nd.BalanceETH)
+	oldRplBalance := math.WeiToEth(nd.BalanceOldRPL)
+	newRplBalance := math.WeiToEth(nd.BalanceRPL)
+	rethBalance := math.WeiToEth(nd.BalanceRETH)
+	eligibleBorrowedEth := state.GetEligibleBorrowedEth(nd)
+	var activeMinipoolCount float64
+	initializedMinipoolCount := float64(0)
+	prelaunchMinipoolCount := float64(0)
+	stakingMinipoolCount := float64(0)
+	dissolvedMinipoolCount := float64(0)
+	finalizedMinipoolCount := float64(0)
+	rplPriceRaw := state.NetworkDetails.RplPrice
+	rplPrice := math.WeiToEth(rplPriceRaw)
+	unclaimedEthRewards := float64(0)
+	unclaimedRplRewards := float64(0)
+	lowETHBalanceThreshold := collector.cfg.Alertmanager.LowETHBalanceThreshold.Value.(float64)
+	megapoolEthBalance := math.WeiToEth(megapoolDetails.EthBalance)
+	nodeDebt := math.WeiToEth(megapoolDetails.NodeDebt)
+	megapoolValidatorCount := float64(megapoolDetails.ValidatorCount)
+	megapoolStakedCount := float64(0)
+	megapoolPrestakeCount := float64(0)
+	megapoolInQueueCount := float64(0)
+	megapoolExitedCount := float64(0)
+	megapoolDissolvedCount := float64(0)
+	megapoolExitingCount := float64(0)
+	megapoolValidatorLockedCount := float64(0)
+	megapoolActiveValidatorCount := float64(megapoolDetails.ActiveValidatorCount)
+	megapoolLockedValidatorCount := float64(megapoolDetails.LockedValidatorCount)
+	megapoolNodeExpressTicketCount := float64(megapoolDetails.NodeExpressTicketCount)
+	megapoolRefundValue := math.WeiToEth(megapoolDetails.RefundValue)
+	megapoolNodeBond := math.WeiToEth(megapoolDetails.NodeBond)
+	megapoolUserCapital := math.WeiToEth(megapoolDetails.UserCapital)
+	megapoolAssignedValue := math.WeiToEth(megapoolDetails.AssignedValue)
+	megapoolDelegateExpiry := float64(megapoolDetails.DelegateExpiry)
+	megapoolPubkeys := state.MegapoolToPubkeysMap[megapoolAddress]
+	megapoolBeaconBalanceTotal := big.NewInt(0)
+	megapoolStandardQueueSize := float64(0)
+	megapoolExpressQueueSize := float64(0)
+	megapoolPendingRewardsNode := float64(0)
+	megapoolPendingRewardsVoter := float64(0)
+	megapoolPendingRewardsPDAO := float64(0)
+	megapoolPendingRewardsReth := float64(0)
+	megapoolBeaconBalance := float64(0)
+	nodeShareofBeaconBalance := float64(0)
+	// Get the cumulative claimed and unclaimed RPL rewards
+	wg.Go(func() error {
+		//legacyClaimNodeAddress := collector.cfg.Smartnode.GetLegacyClaimNodeAddress()
+		//legacyRewardsPoolAddress := collector.cfg.Smartnode.GetLegacyRewardsPoolAddress()
+
+		// Legacy rewards
+		unclaimedRplWei := big.NewInt(0)
+		unclaimedEthWei := big.NewInt(0)
+		newRewards := big.NewInt(0)
+		newClaimedEthRewards := big.NewInt(0)
+
+		// TODO: PERFORMANCE IMPROVEMENTS
+		/*newRewards, err := legacyrewards.CalculateLifetimeNodeRewards(collector.rp, collector.nodeAddress, collector.eventLogInterval, collector.nextRewardsStartBlock, &legacyRewardsPoolAddress, &legacyClaimNodeAddress)
+		if err != nil {
+			return fmt.Errorf("Error getting cumulative RPL rewards: %w", err)
+		}*/
+
+		// Get the claimed and unclaimed intervals
+		unclaimed, claimed, err := rprewards.GetClaimStatus(collector.rp, collector.nodeAddress)
+		if err != nil {
+			return err
+		}
+
+		// Get the totalNodeWeight for the last completed interval
+		previousRewardIndex := state.NetworkDetails.RewardIndex
+		if previousRewardIndex > 0 {
+			previousRewardIndex = previousRewardIndex - 1
+		}
+
+		previousInterval, err := rprewards.GetIntervalInfo(collector.rp, collector.cfg, collector.nodeAddress, previousRewardIndex, nil)
+		if err != nil {
+			return err
+		}
+
+		if !previousInterval.TreeFileExists {
+			collector.logError(fmt.Errorf("Error retrieving previous interval's total node weight: rewards file %s doesn't exist for interval %d", previousInterval.TreeFilePath, previousRewardIndex))
+		}
+
+		if previousInterval.TotalNodeWeight != nil {
+			previousIntervalTotalNodeWeight.Set(previousInterval.TotalNodeWeight)
+		}
+
+		// Get the info for each claimed interval
+		for _, claimedInterval := range claimed {
+			_, exists := collector.handledIntervals[claimedInterval]
+			if !exists {
+				intervalInfo, err := rprewards.GetIntervalInfo(collector.rp, collector.cfg, collector.nodeAddress, claimedInterval, nil)
+				if err != nil {
+					return err
+				}
+				if !intervalInfo.TreeFileExists {
+					collector.logError(fmt.Errorf("Error calculating lifetime node rewards: rewards file %s doesn't exist but interval %d was claimed", intervalInfo.TreeFilePath, claimedInterval))
+					continue
+				}
+
+				newRewards.Add(newRewards, &intervalInfo.CollateralRplAmount.Int)
+				newClaimedEthRewards.Add(newClaimedEthRewards, &intervalInfo.TotalEthAmount.Int)
+				collector.handledIntervals[claimedInterval] = true
+			}
+		}
+		// Get the unclaimed rewards
+		for _, unclaimedInterval := range unclaimed {
+			intervalInfo, err := rprewards.GetIntervalInfo(collector.rp, collector.cfg, collector.nodeAddress, unclaimedInterval, nil)
+			if err != nil {
+				return err
+			}
+			if !intervalInfo.TreeFileExists {
+				collector.logError(fmt.Errorf("Error calculating lifetime node rewards: rewards file %s doesn't exist and interval %d is unclaimed", intervalInfo.TreeFilePath, unclaimedInterval))
+				continue
+			}
+			if intervalInfo.NodeExists {
+				unclaimedRplWei.Add(unclaimedRplWei, &intervalInfo.CollateralRplAmount.Int)
+				unclaimedEthWei.Add(unclaimedEthWei, &intervalInfo.TotalEthAmount.Int)
+			}
+		}
+
+		// Get the block for the next rewards checkpoint
+		header, err := collector.rp.Client.HeaderByNumber(context.Background(), nil)
+		if err != nil {
+			return fmt.Errorf("Error getting latest block header: %w", err)
+		}
+
+		collector.cumulativeRewards += math.WeiToEth(newRewards)
+		collector.cumulativeClaimedEthRewards += math.WeiToEth(newClaimedEthRewards)
+		unclaimedRplRewards = math.WeiToEth(unclaimedRplWei)
+		unclaimedEthRewards = math.WeiToEth(unclaimedEthWei)
+		collector.nextRewardsStartBlock = big.NewInt(0).Add(header.Number, big.NewInt(1))
+
+		return nil
+	})
+
+	// get the beacon client sync status:
+	wg.Go(func() error {
+		progress := float64(0)
+
+		syncStatus, err := collector.bc.GetSyncStatus()
+
+		if err != nil {
+			// NOTE: returning here causes the metric to not be emitted. the endpoint stays responsive, but also slightly more accurate (progress=nothing instead of 0)
+			fmt.Printf("error getting beacon chain sync status: %s", err.Error())
+			return nil
+		}
+		progress = syncStatus.Progress
+		if !syncStatus.Syncing {
+			progress = 1.0
+		}
+		// note this metric is emitted asynchronously, while others in this file tend to be emitted at the end of the outer function (mostly due to dependencies between metrics). See https://github.com/rocket-pool/smartnode/issues/186
+		channel <- prometheus.MustNewConstMetric(
+			collector.clientSyncProgress, prometheus.GaugeValue, progress, "beacon")
+		return nil
+	})
+
+	// get the execution client sync status:
+	wg.Go(func() error {
+		syncStatus := collector.ec.CheckStatus(collector.cfg)
+		// note this metric is emitted asynchronously, while others in this file tend to be emitted at the end of the outer function (mostly due to dependencies between metrics). See https://github.com/rocket-pool/smartnode/issues/186
+		channel <- prometheus.MustNewConstMetric(
+			collector.clientSyncProgress, prometheus.GaugeValue, syncStatus.PrimaryClientStatus.SyncProgress, "execution")
+		return nil
+	})
+
+	// Get the number of active minipools on the node, broken down by status
+	wg.Go(func() error {
+		minipoolCount := len(minipools)
+		for _, mpd := range minipools {
+			if mpd.Finalised {
+				minipoolCount--
+				finalizedMinipoolCount++
+				continue
+			}
+			switch mpd.Status {
+			case types.Initialized:
+				initializedMinipoolCount++
+			case types.Prelaunch:
+				prelaunchMinipoolCount++
+			case types.Staking:
+				stakingMinipoolCount++
+			case types.Dissolved:
+				dissolvedMinipoolCount++
+			}
+		}
+		activeMinipoolCount = float64(minipoolCount)
+		return nil
+	})
+
+	// Get the node's megapool validators, broken down by status
+	// state.MegapoolValidatorGlobalIndex is scoped to this node's own megapool, since the
+	// daemon builds its state via GetHeadStateForNode
+	wg.Go(func() error {
+		for _, validator := range state.MegapoolValidators {
+			if validator.ValidatorInfo.Staked {
+				megapoolStakedCount++
+			}
+			if validator.ValidatorInfo.InPrestake {
+				megapoolPrestakeCount++
+			}
+			if validator.ValidatorInfo.InQueue {
+				megapoolInQueueCount++
+			}
+			if validator.ValidatorInfo.Exited {
+				megapoolExitedCount++
+			}
+			if validator.ValidatorInfo.Locked {
+				megapoolValidatorLockedCount++
+			}
+			if validator.ValidatorInfo.Exiting {
+				megapoolExitingCount++
+			}
+			if validator.ValidatorInfo.Dissolved {
+				megapoolDissolvedCount++
+			}
+		}
+		return nil
+	})
+
+	// Get the megapool details
+	wg.Go(func() error {
+		// Get queue sizes - these are protocol-wide metrics, independent of whether
+		// this node has a megapool deployed
+		megapoolExpressQueueSizeInt, err := deposit.GetExpressQueueLength(collector.rp, nil)
+		if err != nil {
+			return fmt.Errorf("Error getting megapool express queue length: %w", err)
+		}
+		megapoolExpressQueueSize = float64(megapoolExpressQueueSizeInt)
+
+		megapoolStandardQueueSizeInt, err := deposit.GetStandardQueueLength(collector.rp, nil)
+		if err != nil {
+			return fmt.Errorf("Error getting megapool standard queue length: %w", err)
+		}
+		megapoolStandardQueueSize = float64(megapoolStandardQueueSizeInt)
+
+		// First check if the megapool is deployed
+		deployed, err := megapool.GetMegapoolDeployed(collector.rp, collector.nodeAddress, nil)
+		if err != nil {
+			return fmt.Errorf("Error getting megapool deployed status: %w", err)
+		}
+		if !deployed {
+			return nil
+		}
+
+		// Calculate the expected megapool address
+		megapoolAddress, err := megapool.GetMegapoolExpectedAddress(collector.rp, collector.nodeAddress, nil)
+		if err != nil {
+			return fmt.Errorf("Error getting megapool expected address: %w", err)
+		}
+
+		// Load the megapool contract
+		mp, err := megapool.NewMegaPoolV1(collector.rp, megapoolAddress, nil)
+		if err != nil {
+			return fmt.Errorf("Error loading megapool contract: %w", err)
+		}
+
+		mpPendingRewards, err := mp.CalculatePendingRewards(nil)
+		if err != nil {
+			return fmt.Errorf("Error getting megapool pending rewards: %w", err)
+		}
+		megapoolPendingRewardsNode = math.WeiToEth(mpPendingRewards.NodeRewards)
+		megapoolPendingRewardsVoter = math.WeiToEth(mpPendingRewards.VoterRewards)
+		megapoolPendingRewardsPDAO = math.WeiToEth(mpPendingRewards.ProtocolDAORewards)
+		megapoolPendingRewardsReth = math.WeiToEth(mpPendingRewards.RethRewards)
+
+		currentEpoch := state.BeaconConfig.SlotToEpoch(state.BeaconSlotNumber)
+		totalEffectiveBeaconBalance := big.NewInt(0)
+		for _, pubkey := range megapoolPubkeys {
+			info, infoExists := state.GetMegapoolValidatorInfo(megapoolAddress, pubkey)
+			if !infoExists {
+				continue
+			}
+			if !info.ValidatorInfo.Staked || info.ValidatorInfo.Exited || info.ValidatorInfo.Exiting {
+				continue
+			}
+			validator, exists := state.MegapoolValidatorDetails[pubkey]
+			if !exists {
+				continue
+			}
+			// Skip validators that haven't activated yet
+			if currentEpoch <= validator.ActivationEpoch {
+				continue
+			}
+			megapoolBeaconBalanceTotal.Add(megapoolBeaconBalanceTotal, math.GweiToWei(float64(validator.Balance)))
+			totalEffectiveBeaconBalance.Add(totalEffectiveBeaconBalance, math.GweiToWei(float64(validator.EffectiveBalance)))
+		}
+
+		megapoolBeaconBalance = math.WeiToEth(megapoolBeaconBalanceTotal)
+		if megapoolBeaconBalanceTotal.Cmp(totalEffectiveBeaconBalance) > 0 {
+			toBeSkimmed := big.NewInt(0).Sub(megapoolBeaconBalanceTotal, totalEffectiveBeaconBalance)
+			rewardsSplit, err := mp.CalculateRewards(toBeSkimmed, nil)
+			if err != nil {
+				return fmt.Errorf("Error calculating megapool rewards: %w", err)
+			}
+			nodeShareofBeaconBalance = math.WeiToEth(big.NewInt(0).Add(rewardsSplit.NodeRewards, megapoolDetails.NodeBond))
+		}
+
+		return nil
+	})
+	// Wait for data
+	if err := wg.Wait(); err != nil {
+		collector.logError(err)
+		return
+	}
+
+	// Calculate the node weight, using the same inputs as the rewards tree
+	nodeWeight := state.GetUnscaledNodeWeight(nd)
+
+	// All of the node's staked RPL (legacy + megapool) earns rewards
+	totalStakedRpl := nodeLegacyStakedRpl + nodeMegapoolStakedRpl
+
+	rewardableStakeFloat := float64(0)
+	if eligibleBorrowedEth.Sign() > 0 {
+		rewardableStakeFloat = totalStakedRpl
+	}
+
+	reductionWindowStart := state.NetworkDetails.BondReductionWindowStart
+	reductionWindowLength := state.NetworkDetails.BondReductionWindowLength
+	reductionWindowEnd := reductionWindowStart + reductionWindowLength
+
+	genesisTime := time.Unix(int64(state.BeaconConfig.GenesisTime), 0)
+	secondsSinceGenesis := time.Duration(state.BeaconSlotNumber*state.BeaconConfig.SecondsPerSlot) * time.Second
+	blockTime := genesisTime.Add(secondsSinceGenesis)
+
+	zero := big.NewInt(0)
+	pendingBorrowedEth := big.NewInt(0)
+	pendingBondedEth := big.NewInt(0)
+	for _, mpd := range minipools {
+		if mpd.Finalised {
+			// Ignore finalized minipools in the ratio math
+			continue
+		}
+		bonded := big.NewInt(0)
+
+		reduceBondTime := time.Unix(mpd.ReduceBondTime.Int64(), 0)
+		timeSinceReductionStart := blockTime.Sub(reduceBondTime)
+		if mpd.ReduceBondTime.Cmp(zero) == 0 ||
+			mpd.ReduceBondCancelled ||
+			timeSinceReductionStart > reductionWindowEnd {
+			// No pending bond reduction
+			bonded = mpd.NodeDepositBalance
+		} else {
+			// Pending bond reducton
+			bonded.Set(mpd.ReduceBondValue)
+		}
+		borrowed := big.NewInt(0).Sub(math.EthToWei(32), bonded)
+		pendingBorrowedEth.Add(pendingBorrowedEth, borrowed)
+		pendingBondedEth.Add(pendingBondedEth, bonded)
+	}
+
+	// Calculate the estimated rewards
+	rewardsIntervalDays := rewardsInterval.Seconds() / (60 * 60 * 24)
+	inflationPerDay := math.WeiToEth(inflationInterval)
+	totalRplAtNextCheckpoint := (math.Pow(inflationPerDay, float64(rewardsIntervalDays)) - 1) * math.WeiToEth(totalRplSupply)
+	if totalRplAtNextCheckpoint < 0 {
+		totalRplAtNextCheckpoint = 0
+	}
+
+	/*
+	 * Calculates a RPIP-30 RPL reward estimate. Assumes that RPIP-30 has been fully phased in
+	 *
+	 * Formula:
+	 * 		current_node_weight / (current_node_weight + previous_interval_total_node_weight) * estimated_collateral_rewards
+	 *
+	 * Note that if the node has no effective stake, has no eligibleBorrowedETH, or if this is the very first rewards
+	 * period we don't attempt an estimate and simply use 0.
+	 */
+	estimatedRewards := float64(0)
+	if nodeWeight.Cmp(big.NewInt(0)) == 1 && state.NetworkDetails.RewardIndex > 0 {
+
+		nodeWeightSum := big.NewInt(0).Add(nodeWeight, previousIntervalTotalNodeWeight)
+
+		// Convert to a float, accuracy loss is meaningless compared to the heuristic's natural inaccuracy.
+		// nodeWeightRatio = current_node_weight / (current_node_weight + previous_interval_total_node_weight)
+		nodeWeightRatio, _ := big.NewFloat(0).Quo(
+			big.NewFloat(0).SetInt(nodeWeight),
+			big.NewFloat(0).SetInt(nodeWeightSum)).Float64()
+
+		// estimatedRewards = nodeWeightRatio * estimated_collateral_rewards
+		estimatedRewards = nodeWeightRatio * totalRplAtNextCheckpoint * nodeOperatorRewardsPercent
+	}
+
+	// Calculate the RPL APR
+	rplApr := float64(0)
+	if totalStakedRpl > 0 {
+		rplApr = estimatedRewards / totalStakedRpl / rewardsInterval.Hours() * (24 * 365) * 100
+	}
+
+	// Calculate the total deposits and corresponding beacon chain balance share
+	totalDepositBalance := float64(0)
+	totalNodeShare := float64(0)
+	totalBeaconBalance := float64(0)
+	for _, minipool := range minipools {
+		validator, exists := state.MinipoolValidatorDetails[minipool.Pubkey]
+		if exists {
+			totalBeaconBalance += math.GweiToEth(validator.Balance)
+		}
+		totalDepositBalance += math.WeiToEth(minipool.NodeDepositBalance)
+		totalNodeShare += math.WeiToEth(minipool.NodeShareOfBeaconBalance)
+	}
+
+	totalMinipoolBalance := float64(0)
+	totalMinipoolShare := float64(0)
+	totalRefundBalance := float64(0)
+	for _, minipool := range minipools {
+		totalMinipoolBalance += math.WeiToEth(minipool.DistributableBalance)
+		totalMinipoolShare += math.WeiToEth(minipool.NodeShareOfBalance)
+		totalRefundBalance += math.WeiToEth(minipool.NodeRefundBalance)
+	}
+
+	// RPL collateral
+	totalBondedEthFloat := math.WeiToEth(pendingBondedEth) + math.WeiToEth(nd.MegapoolEthBonded)
+	var bondedCollateralRatio float64
+	if totalBondedEthFloat == 0 {
+		bondedCollateralRatio = 0
+	} else {
+		bondedCollateralRatio = rplPrice * totalStakedRpl / totalBondedEthFloat
+	}
+
+	totalBorrowedEthFloat := math.WeiToEth(pendingBorrowedEth) + math.WeiToEth(nd.MegapoolETHBorrowed)
+	var borrowedCollateralRatio float64
+	if totalBorrowedEthFloat == 0 {
+		borrowedCollateralRatio = 0
+	} else {
+		borrowedCollateralRatio = rplPrice * totalStakedRpl / totalBorrowedEthFloat
+	}
+
+	// Update all the metrics
+	channel <- prometheus.MustNewConstMetric(
+		collector.nodeLegacyStakedRpl, prometheus.GaugeValue, nodeLegacyStakedRpl)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolStakedRpl, prometheus.GaugeValue, nodeMegapoolStakedRpl)
+	channel <- prometheus.MustNewConstMetric(
+		collector.effectiveStakedRpl, prometheus.GaugeValue, effectiveStakedRpl)
+	channel <- prometheus.MustNewConstMetric(
+		collector.rewardableStakedRpl, prometheus.GaugeValue, rewardableStakeFloat)
+	channel <- prometheus.MustNewConstMetric(
+		collector.cumulativeRplRewards, prometheus.GaugeValue, collector.cumulativeRewards)
+	channel <- prometheus.MustNewConstMetric(
+		collector.expectedRplRewards, prometheus.GaugeValue, estimatedRewards)
+	channel <- prometheus.MustNewConstMetric(
+		collector.rplApr, prometheus.GaugeValue, rplApr)
+	channel <- prometheus.MustNewConstMetric(
+		collector.balances, prometheus.GaugeValue, ethBalance, "ETH")
+	channel <- prometheus.MustNewConstMetric(
+		collector.balances, prometheus.GaugeValue, oldRplBalance, "Legacy RPL")
+	channel <- prometheus.MustNewConstMetric(
+		collector.balances, prometheus.GaugeValue, newRplBalance, "New RPL")
+	channel <- prometheus.MustNewConstMetric(
+		collector.balances, prometheus.GaugeValue, rethBalance, "rETH")
+	channel <- prometheus.MustNewConstMetric(
+		collector.activeMinipoolCount, prometheus.GaugeValue, activeMinipoolCount)
+	channel <- prometheus.MustNewConstMetric(
+		collector.minipoolStatusCount, prometheus.GaugeValue, initializedMinipoolCount, "initialized")
+	channel <- prometheus.MustNewConstMetric(
+		collector.minipoolStatusCount, prometheus.GaugeValue, prelaunchMinipoolCount, "prelaunch")
+	channel <- prometheus.MustNewConstMetric(
+		collector.minipoolStatusCount, prometheus.GaugeValue, stakingMinipoolCount, "staking")
+	channel <- prometheus.MustNewConstMetric(
+		collector.minipoolStatusCount, prometheus.GaugeValue, dissolvedMinipoolCount, "dissolved")
+	channel <- prometheus.MustNewConstMetric(
+		collector.minipoolStatusCount, prometheus.GaugeValue, finalizedMinipoolCount, "finalized")
+	channel <- prometheus.MustNewConstMetric(
+		collector.depositedEth, prometheus.GaugeValue, totalDepositBalance)
+	channel <- prometheus.MustNewConstMetric(
+		collector.minipoolBeaconShare, prometheus.GaugeValue, totalNodeShare)
+	channel <- prometheus.MustNewConstMetric(
+		collector.minipoolBeaconBalance, prometheus.GaugeValue, totalBeaconBalance)
+	channel <- prometheus.MustNewConstMetric(
+		collector.minipoolBalance, prometheus.GaugeValue, totalMinipoolBalance)
+	channel <- prometheus.MustNewConstMetric(
+		collector.minipoolShare, prometheus.GaugeValue, totalMinipoolShare)
+	channel <- prometheus.MustNewConstMetric(
+		collector.minipoolRefundBalance, prometheus.GaugeValue, totalRefundBalance)
+	channel <- prometheus.MustNewConstMetric(
+		collector.unclaimedRewards, prometheus.GaugeValue, unclaimedRplRewards)
+	channel <- prometheus.MustNewConstMetric(
+		collector.unclaimedEthRewards, prometheus.GaugeValue, unclaimedEthRewards)
+	channel <- prometheus.MustNewConstMetric(
+		collector.claimedEthRewards, prometheus.GaugeValue, collector.cumulativeClaimedEthRewards)
+	channel <- prometheus.MustNewConstMetric(
+		collector.borrowedCollateralRatio, prometheus.GaugeValue, borrowedCollateralRatio)
+	channel <- prometheus.MustNewConstMetric(
+		collector.bondedCollateralRatio, prometheus.GaugeValue, bondedCollateralRatio)
+	channel <- prometheus.MustNewConstMetric(
+		collector.lowETHBalanceThreshold, prometheus.GaugeValue, lowETHBalanceThreshold)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolEthBalance, prometheus.GaugeValue, megapoolEthBalance)
+	channel <- prometheus.MustNewConstMetric(
+		collector.nodeDebt, prometheus.GaugeValue, nodeDebt)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolValidatorCount, prometheus.GaugeValue, megapoolValidatorCount)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolStatusCount, prometheus.GaugeValue, megapoolStakedCount, "staked")
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolStatusCount, prometheus.GaugeValue, megapoolPrestakeCount, "prestake")
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolStatusCount, prometheus.GaugeValue, megapoolInQueueCount, "in_queue")
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolStatusCount, prometheus.GaugeValue, megapoolExitedCount, "exited")
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolStatusCount, prometheus.GaugeValue, megapoolValidatorLockedCount, "locked")
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolStatusCount, prometheus.GaugeValue, megapoolExitingCount, "exiting")
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolStatusCount, prometheus.GaugeValue, megapoolDissolvedCount, "dissolved")
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolNodeExpressTicketCount, prometheus.GaugeValue, megapoolNodeExpressTicketCount)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolRefundValue, prometheus.GaugeValue, megapoolRefundValue)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolNodeBond, prometheus.GaugeValue, megapoolNodeBond)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolUserCapital, prometheus.GaugeValue, megapoolUserCapital)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolAssignedValue, prometheus.GaugeValue, megapoolAssignedValue)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolActiveValidatorCount, prometheus.GaugeValue, megapoolActiveValidatorCount)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolBeaconBalance, prometheus.GaugeValue, megapoolBeaconBalance)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolNodeShareofBeaconBalance, prometheus.GaugeValue, nodeShareofBeaconBalance)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolLockedValidatorCount, prometheus.GaugeValue, megapoolLockedValidatorCount)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolDelegateExpiry, prometheus.GaugeValue, megapoolDelegateExpiry)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolStandardQueueSize, prometheus.GaugeValue, megapoolStandardQueueSize)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolExpressQueueSize, prometheus.GaugeValue, megapoolExpressQueueSize)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolQueueBond, prometheus.GaugeValue, megapoolQueueBond)
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolPendingRewards, prometheus.GaugeValue, megapoolPendingRewardsNode, "node")
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolPendingRewards, prometheus.GaugeValue, megapoolPendingRewardsVoter, "voter")
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolPendingRewards, prometheus.GaugeValue, megapoolPendingRewardsReth, "reth")
+	channel <- prometheus.MustNewConstMetric(
+		collector.megapoolPendingRewards, prometheus.GaugeValue, megapoolPendingRewardsPDAO, "pdao")
+
+}
+
+// Log error messages
+func (collector *NodeCollector) logError(err error) {
+	fmt.Printf("[%s] %s\n", collector.logPrefix, err.Error())
+}

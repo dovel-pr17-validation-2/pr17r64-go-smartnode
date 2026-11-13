@@ -1,0 +1,47 @@
+package service
+
+import (
+	"fmt"
+
+	"github.com/urfave/cli/v3"
+
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+	"github.com/rocket-pool/smartnode/rocketpool/validator"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+// Restarts the Validator client
+func restartVc(c *cli.Command) (*api.RestartVcResponse, error) {
+
+	// Get services
+	bc, err := services.GetBeaconClient(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+	d, err := services.GetDocker(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.RestartVcResponse{}
+
+	if err := validator.RestartValidator(cfg, bc, nil, d); err != nil {
+		return nil, fmt.Errorf("error restarting validator client: %w", err)
+	}
+
+	// Return response
+	return &response, nil
+
+}
+
+func restartVcHandler(ctx snroute.WriteContext) {
+	resp, err := restartVc(ctx.Command())
+	response.WriteResponse(ctx.Writer, resp, err)
+}

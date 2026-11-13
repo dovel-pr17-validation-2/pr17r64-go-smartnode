@@ -1,0 +1,128 @@
+package minipool
+
+import (
+	"fmt"
+
+	"github.com/ethereum/go-ethereum/common"
+
+	"github.com/rocket-pool/smartnode/bindings/transactions/gaslimit"
+	cliutils "github.com/rocket-pool/smartnode/rocketpool-cli/cli"
+	"github.com/rocket-pool/smartnode/rocketpool-cli/cli/prompt"
+	"github.com/rocket-pool/smartnode/shared/services/gas"
+	"github.com/rocket-pool/smartnode/shared/services/rocketpool"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func delegateUpgradeMinipools(minipool string, includeFinalized, yes bool) error {
+
+	// Get RP client
+	rp, err := rocketpool.NewClient().WithReady()
+	if err != nil {
+		return err
+	}
+	defer rp.Close()
+
+	// Get minipool statuses
+	status, err := rp.MinipoolStatus()
+	if err != nil {
+		return err
+	}
+	latestDelegateResponse, err := rp.GetLatestDelegate()
+	if err != nil {
+		return err
+	}
+
+	minipools := []api.MinipoolDetails{}
+	for _, mp := range status.Minipools {
+		if mp.Delegate != latestDelegateResponse.Address && !mp.UseLatestDelegate {
+			if includeFinalized || !mp.Finalised {
+				minipools = append(minipools, mp)
+			}
+		}
+	}
+
+	if len(minipools) == 0 {
+		fmt.Println("No minipools are eligible for delegate upgrades.")
+		return nil
+	}
+
+	// Get selected minipools
+	var selectedMinipools []common.Address
+
+	if minipool != "" && minipool != "all" {
+		selectedAddress := common.HexToAddress(minipool)
+		selectedMinipools = []common.Address{selectedAddress}
+	} else {
+		if minipool == "" {
+			// Prompt for minipool selection
+			options := make([]string, len(minipools)+1)
+			options[0] = "All available minipools"
+			for mi, minipool := range minipools {
+				options[mi+1] = fmt.Sprintf("%s (using delegate %s)", minipool.Address.Hex(), minipool.Delegate.Hex())
+			}
+			selected, _ := prompt.Select("Please select a minipool to upgrade:", options)
+
+			// Get minipools
+			if selected == 0 {
+				selectedMinipools = make([]common.Address, len(minipools))
+				for mi, minipool := range minipools {
+					selectedMinipools[mi] = minipool.Address
+				}
+			} else {
+				selectedMinipools = []common.Address{minipools[selected-1].Address}
+			}
+		} else {
+			// All minipools
+			selectedMinipools = make([]common.Address, len(minipools))
+			for mi, minipool := range minipools {
+				selectedMinipools[mi] = minipool.Address
+			}
+		}
+	}
+
+	// Get the total gas limit estimate
+	var gasLimits gaslimit.Limits
+	for _, minipool := range selectedMinipools {
+		canResponse, err := rp.CanDelegateUpgradeMinipool(minipool)
+		if err != nil {
+			fmt.Printf("WARNING: Couldn't get gas price for upgrade transaction (%s)\n", err)
+			break
+		}
+		fmt.Printf("Minipool %s will upgrade to delegate contract %s.\n", minipool.Hex(), canResponse.LatestDelegateAddress.Hex())
+		gasLimits = gasLimits.Add(canResponse.GasLimits)
+	}
+
+	// Get max fees
+	g, err := gas.GetMaxFeeAndLimit(gasLimits, rp, yes)
+	if err != nil {
+		return err
+	}
+
+	// Prompt for confirmation
+	if prompt.Declined(yes, "Are you sure you want to upgrade %d minipools?", len(selectedMinipools)) {
+		fmt.Println("Cancelled.")
+		return nil
+	}
+
+	// Upgrade minipools
+	for _, minipool := range selectedMinipools {
+		g.Assign(rp)
+		response, err := rp.DelegateUpgradeMinipool(minipool)
+		if err != nil {
+			fmt.Printf("Could not upgrade minipool %s: %s.\n", minipool.Hex(), err)
+			continue
+		}
+
+		fmt.Printf("Upgrading minipool %s...\n", minipool.Hex())
+		cliutils.PrintTransactionHash(rp, response.TxHash)
+		if _, err = rp.WaitForTransaction(response.TxHash); err != nil {
+			fmt.Printf("Could not upgrade minipool %s: %s.\n", minipool.Hex(), err)
+		} else {
+			fmt.Printf("Successfully upgraded minipool %s.\n", minipool.Hex())
+		}
+	}
+
+	// Return
+	return nil
+
+}

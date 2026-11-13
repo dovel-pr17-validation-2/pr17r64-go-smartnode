@@ -1,0 +1,54 @@
+package auction
+
+import (
+	"github.com/urfave/cli/v3"
+
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func getLots(c *cli.Command) (*api.AuctionLotsResponse, error) {
+
+	// Get services
+	if err := services.RequireNodeWallet(c); err != nil {
+		return nil, err
+	}
+	if err := services.RequireRocketStorage(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.AuctionLotsResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get lot details
+	lots, err := getAllLotDetails(rp, nodeAccount.Address)
+	if err != nil {
+		return nil, err
+	}
+	response.Lots = lots
+
+	// Return response
+	return &response, nil
+
+}
+
+func lotsHandler(ctx snroute.Context) {
+	resp, err := getLots(ctx.Command())
+	response.WriteResponse(ctx.Writer, resp, err)
+}

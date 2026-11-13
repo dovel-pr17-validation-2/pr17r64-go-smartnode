@@ -1,0 +1,88 @@
+package security
+
+import (
+	"fmt"
+	"sync"
+
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+
+	"github.com/rocket-pool/smartnode/bindings/rocketpool"
+	"github.com/rocket-pool/smartnode/bindings/transactions/gaslimit"
+)
+
+// Estimate the gas of Join
+func EstimateJoinGas(rp *rocketpool.RocketPool, opts *bind.TransactOpts) (gaslimit.Limits, error) {
+	rocketDAOSecurityActions, err := getRocketDAOSecurityActions(rp, nil)
+	if err != nil {
+		return gaslimit.Limits{}, err
+	}
+	return rocketDAOSecurityActions.GetTransactionGasInfo(opts, "actionJoin")
+}
+
+// Join the security DAO
+// Requires an executed invite proposal
+func Join(rp *rocketpool.RocketPool, opts *bind.TransactOpts) (common.Hash, error) {
+	rocketDAOSecurityActions, err := getRocketDAOSecurityActions(rp, nil)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	tx, err := rocketDAOSecurityActions.Transact(opts, "actionJoin")
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("error joining the security DAO: %w", err)
+	}
+	return tx.Hash(), nil
+}
+
+// Estimate the gas of RequestLeave
+func EstimateRequestLeaveGas(rp *rocketpool.RocketPool, opts *bind.TransactOpts) (gaslimit.Limits, error) {
+	rocketDAOSecurityActions, err := getRocketDAOSecurityActions(rp, nil)
+	if err != nil {
+		return gaslimit.Limits{}, err
+	}
+	return rocketDAOSecurityActions.GetTransactionGasInfo(opts, "actionRequestLeave")
+}
+
+// A member who wishes to leave the security council can call this method to initiate the process
+func RequestLeave(rp *rocketpool.RocketPool, opts *bind.TransactOpts) (common.Hash, error) {
+	rocketDAOSecurityActions, err := getRocketDAOSecurityActions(rp, nil)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	tx, err := rocketDAOSecurityActions.Transact(opts, "actionRequestLeave")
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("error requesting to leave the security DAO: %w", err)
+	}
+	return tx.Hash(), nil
+}
+
+// Estimate the gas of Leave
+func EstimateLeaveGas(rp *rocketpool.RocketPool, opts *bind.TransactOpts) (gaslimit.Limits, error) {
+	rocketDAOSecurityActions, err := getRocketDAOSecurityActions(rp, nil)
+	if err != nil {
+		return gaslimit.Limits{}, err
+	}
+	return rocketDAOSecurityActions.GetTransactionGasInfo(opts, "actionLeave")
+}
+
+// A member who has asked to leave and waited the required time can call this method to formally leave the security council
+func Leave(rp *rocketpool.RocketPool, opts *bind.TransactOpts) (common.Hash, error) {
+	rocketDAOSecurityActions, err := getRocketDAOSecurityActions(rp, nil)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	tx, err := rocketDAOSecurityActions.Transact(opts, "actionLeave")
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("error leaving the security DAO: %w", err)
+	}
+	return tx.Hash(), nil
+}
+
+// Get contracts
+var rocketDAOSecurityActionsLock sync.Mutex
+
+func getRocketDAOSecurityActions(rp *rocketpool.RocketPool, opts *bind.CallOpts) (*rocketpool.Contract, error) {
+	rocketDAOSecurityActionsLock.Lock()
+	defer rocketDAOSecurityActionsLock.Unlock()
+	return rp.GetContract("rocketDAOSecurityActions", opts)
+}

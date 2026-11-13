@@ -1,0 +1,169 @@
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+
+	"github.com/ethereum/go-ethereum/common"
+
+	"github.com/rocket-pool/smartnode/bindings/rocketpool"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/services/beacon/client"
+	"github.com/rocket-pool/smartnode/shared/services/config"
+	"github.com/rocket-pool/smartnode/shared/services/state"
+	cfgtypes "github.com/rocket-pool/smartnode/shared/types/config"
+)
+
+// A basic CLI tool which can be used to serialize NetworkState objects to files
+// for future use.
+// Accepts arguments for a beacon node URL, an execution node URL, and a slot number
+// to get the state for.
+
+var bnFlag = flag.String("b", "http://localhost:5052", "The beacon node URL")
+var elFlag = flag.String("e", "http://localhost:8545", "The execution node URL")
+var slotFlag = flag.Uint64("slot", 0, "The slot number to get the state for")
+var networkFlag = flag.String("network", "mainnet", "The network to get the state for, i.e. 'mainnet' or 'testnet'")
+var prettyFlag = flag.Bool("p", false, "Pretty print the output")
+var inputFlag = flag.Bool("i", false, "Parse a network state from stdin instead of retrieving it from the network")
+var criticalDutiesSlotsFlag = flag.Bool("critical-duties-slots", false, "If passed, output a list of critical duties slots for the given state as if it were the final state in a 6300 epoch interval. This is outputted instead of the state json.")
+var criticalDutiesEpochCountFlag = flag.Uint64("critical-duties-epoch-count", 6300, "The number of epochs to consider when calculating critical duties")
+var minimalFlag = flag.Bool("minimal", false, "Truncate every list/map to at most one entry (useful for producing a small inspection file)")
+
+// truncateNetworkState reduces every slice and map field to at most one element.
+func truncateNetworkState(ns *state.NetworkStateIndex) {
+	if len(ns.NodeDetails) > 1 {
+		ns.NodeDetails = ns.NodeDetails[:1]
+	}
+	if len(ns.MinipoolDetails) > 1 {
+		ns.MinipoolDetails = ns.MinipoolDetails[:1]
+	}
+	if len(ns.MegapoolValidators) > 1 {
+		ns.MegapoolValidators = ns.MegapoolValidators[:1]
+	}
+	if len(ns.OracleDaoMemberDetails) > 1 {
+		ns.OracleDaoMemberDetails = ns.OracleDaoMemberDetails[:1]
+	}
+	if len(ns.ProtocolDaoProposalDetails) > 1 {
+		ns.ProtocolDaoProposalDetails = ns.ProtocolDaoProposalDetails[:1]
+	}
+	if len(ns.MinipoolValidatorDetails) > 1 {
+		for k := range ns.MinipoolValidatorDetails {
+			delete(ns.MinipoolValidatorDetails, k)
+			if len(ns.MinipoolValidatorDetails) == 1 {
+				break
+			}
+		}
+	}
+	if len(ns.MegapoolValidatorDetails) > 1 {
+		for k := range ns.MegapoolValidatorDetails {
+			delete(ns.MegapoolValidatorDetails, k)
+			if len(ns.MegapoolValidatorDetails) == 1 {
+				break
+			}
+		}
+	}
+}
+
+func main() {
+	flag.Parse()
+
+	rpCfg, err := config.NewRocketPoolConfig("", true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading networks: %v\n", err)
+		os.Exit(1)
+	}
+	sn := rpCfg.Smartnode
+	network := cfgtypes.Network(*networkFlag)
+	if rpCfg.LoadedNetworks().GetNetwork(network) == nil {
+		fmt.Fprintf(os.Stderr, "Invalid network: %s\n", *networkFlag)
+		fmt.Fprintf(os.Stderr, "Valid networks:")
+		for _, n := range rpCfg.LoadedNetworks().AllNetworks() {
+			fmt.Fprintf(os.Stderr, " %s", n.Name)
+		}
+		fmt.Fprintln(os.Stderr)
+		os.Exit(1)
+	}
+	sn.Network.Value = network
+
+	ec, err := services.NewEthClient(*elFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error connecting to execution node: %v\n", err)
+		os.Exit(1)
+	}
+
+	contracts := sn.GetStateManagerContracts()
+	fmt.Fprintf(os.Stderr, "Contracts: %+v\n", contracts)
+
+	rocketStorage := sn.GetStorageAddress()
+
+	rp, err := rocketpool.NewRocketPool(ec, common.HexToAddress(rocketStorage))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating rocketpool: %v\n", err)
+		os.Exit(1)
+	}
+	bc := client.NewStandardHttpClient(*bnFlag)
+	sm := state.NewNetworkStateManager(rp, contracts, bc, nil)
+
+	var networkState *state.NetworkStateIndex
+
+	if *inputFlag {
+		decoder := json.NewDecoder(os.Stdin)
+		err := decoder.Decode(&networkState)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error decoding network state: %v\n", err)
+			os.Exit(1)
+		}
+	} else if *slotFlag == 0 {
+		fmt.Fprintf(os.Stderr, "Slot number not provided, defaulting to head slot.\n")
+		networkState, err = sm.GetHeadState()
+	} else {
+		networkState, err = sm.GetStateForSlot(*slotFlag)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting network state: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *minimalFlag {
+		truncateNetworkState(networkState)
+	}
+
+	if *criticalDutiesSlotsFlag {
+		nsi := networkState.ToIndexedNetworkState()
+		criticalDutiesEpochs := state.NewCriticalDutiesEpochs(*criticalDutiesEpochCountFlag, nsi)
+		fmt.Fprintf(os.Stderr, "Critical duties epochs to check: %d\n", len(criticalDutiesEpochs.CriticalDuties))
+
+		criticalDutiesSlots, err := state.NewCriticalDutiesSlots(criticalDutiesEpochs, bc)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating critical duties slots: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Serialize the critical duties slots to stdout
+		encoder := json.NewEncoder(os.Stdout)
+		if *prettyFlag {
+			encoder.SetIndent("", "  ")
+		}
+		err = encoder.Encode(criticalDutiesSlots)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error encoding critical duties slots: %v\n", err)
+			os.Exit(1)
+		}
+
+		os.Exit(0)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "Network state fetched, outputting to stdout\n")
+	encoder := json.NewEncoder(os.Stdout)
+	if *prettyFlag {
+		encoder.SetIndent("", "  ")
+	}
+	err = encoder.Encode(networkState)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error encoding network state: %v\n", err)
+		os.Exit(1)
+	}
+}

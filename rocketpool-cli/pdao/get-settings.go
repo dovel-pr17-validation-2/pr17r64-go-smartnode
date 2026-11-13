@@ -1,0 +1,170 @@
+package pdao
+
+import (
+	"fmt"
+
+	"github.com/rocket-pool/smartnode/shared/math"
+	"github.com/rocket-pool/smartnode/shared/services/rocketpool"
+)
+
+func getSettings() error {
+	// Get RP client
+	rp, err := rocketpool.NewClient().WithReady()
+	if err != nil {
+		return err
+	}
+	defer rp.Close()
+
+	// Get all PDAO settings
+	response, err := rp.PDAOGetSettings()
+	if err != nil {
+		return err
+	}
+
+	// Auction
+	fmt.Println("== Auction Settings ==")
+	fmt.Printf("\tCreating New Lot Enabled: %t\n", response.Auction.IsCreateLotEnabled)
+	fmt.Printf("\tBidding on Lots Enabled:  %t\n", response.Auction.IsBidOnLotEnabled)
+	fmt.Printf("\tMin ETH per Lot:          %.6f ETH\n", math.WeiToEth(response.Auction.LotMinimumEthValue))
+	fmt.Printf("\tMax ETH per Lot:          %.6f ETH\n", math.WeiToEth(response.Auction.LotMaximumEthValue))
+	fmt.Printf("\tLot Duration:             %s\n", response.Auction.LotDuration)
+	fmt.Printf("\tStarting Price Ratio:     %.2f%%\n", math.WeiToEth(response.Auction.LotStartingPriceRatio)*100)
+	fmt.Printf("\tReserve Price Ratio:      %.2f%%\n", math.WeiToEth(response.Auction.LotReservePriceRatio)*100)
+	fmt.Println()
+
+	// Deposit
+	fmt.Println("== Deposit Settings ==")
+	fmt.Printf("\tPool Deposits Enabled:              %t\n", response.Deposit.IsDepositingEnabled)
+	fmt.Printf("\tDeposit Assignments Enabled:        %t\n", response.Deposit.AreDepositAssignmentsEnabled)
+	fmt.Printf("\tMin Pool Deposit:                   %.6f ETH\n", math.WeiToEth(response.Deposit.MinimumDeposit))
+	fmt.Printf("\tMax Deposit Pool Size:              %.6f ETH\n", math.WeiToEth(response.Deposit.MaximumDepositPoolSize))
+	fmt.Printf("\tMax Total Assigns Per Deposit:      %d\n", response.Deposit.MaximumAssignmentsPerDeposit)
+	fmt.Printf("\tMax Socialized Assigns Per Deposit: %d\n", response.Deposit.MaximumSocialisedAssignmentsPerDeposit)
+	fmt.Printf("\tDeposit Fee:                        %.2f%%\n", math.WeiToEth(response.Deposit.DepositFee)*100)
+	fmt.Printf("\tExpress Queue Rate:                 %d\n", response.Deposit.ExpressQueueRate)
+	fmt.Printf("\tExpress Queue Tickets Provision:    %d\n", response.Deposit.ExpressQueueTicketsBaseProvision)
+	fmt.Println()
+
+	// Inflation
+	fmt.Println("== Inflation Settings ==")
+	fmt.Printf("\tInterval Rate:  %.6f\n", math.WeiToEth(response.Inflation.IntervalRate))
+	fmt.Printf("\tInterval Start: %s\n", response.Inflation.StartTime)
+	fmt.Println()
+
+	// Minipool
+	fmt.Println("== Minipool Settings ==")
+	fmt.Printf("\tMark as Withdrawable Enabled: %t\n", response.Minipool.IsSubmitWithdrawableEnabled)
+	fmt.Printf("\tStaking Launch Timeout:       %s\n", response.Minipool.LaunchTimeout)
+	fmt.Printf("\tBond Reduction Enabled:       %t\n", response.Minipool.IsBondReductionEnabled)
+	fmt.Printf("\tMax Number of Minipools:      %d\n", response.Minipool.MaximumCount)
+	fmt.Printf("\tUser Distribute Start Wait:   %s\n", response.Minipool.UserDistributeWindowStart)
+	fmt.Printf("\tUser Distribute Window:       %s\n", response.Minipool.UserDistributeWindowLength)
+	// MaximumPenaltyCount is not live on devnet yet
+	// fmt.Printf("\tMax Penalty Count:            %d\n", response.Minipool.MaximumPenaltyCount)
+
+	fmt.Println()
+
+	// Network
+	fmt.Println("== Network Settings ==")
+	fmt.Printf("\toDAO Consensus Quorum:                        %.2f%%\n", math.WeiToEth(response.Network.OracleDaoConsensusThreshold)*100)
+	fmt.Printf("\tNode Penalty Quorum:                          %.2f%%\n", math.WeiToEth(response.Network.NodePenaltyThreshold)*100)
+	fmt.Printf("\tPenalty Size:                                 %.2f%%\n", math.WeiToEth(response.Network.PerPenaltyRate)*100)
+	fmt.Printf("\tBalance Submission Enabled:                   %t\n", response.Network.IsSubmitBalancesEnabled)
+	fmt.Printf("\tBalance Submission Freq:                      %s\n", response.Network.SubmitBalancesFrequency)
+	fmt.Printf("\tPrice Submission Enabled:                     %t\n", response.Network.IsSubmitPricesEnabled)
+	fmt.Printf("\tPrice Submission Freq:                        %s\n", response.Network.SubmitPricesFrequency)
+	fmt.Printf("\tMin Commission:                               %.2f%%\n", math.WeiToEth(response.Network.MinimumNodeFee)*100)
+	fmt.Printf("\tTarget Commission:                            %.2f%%\n", math.WeiToEth(response.Network.TargetNodeFee)*100)
+	fmt.Printf("\tMax Commission:                               %.2f%%\n", math.WeiToEth(response.Network.MaximumNodeFee)*100)
+	fmt.Printf("\tCommission Demand Range:                      %.6f ETH\n", math.WeiToEth(response.Network.NodeFeeDemandRange))
+	fmt.Printf("\trETH Collateral Target:                       %.2f%%\n", math.WeiToEth(response.Network.TargetRethCollateralRate)*100)
+	fmt.Printf("\tRewards Submission Enabled:                   %t\n", response.Network.IsSubmitRewardsEnabled)
+	fmt.Printf("\tNode Commission Share:                        %.2f%%\n", math.WeiToEth(response.Network.NodeCommissionShare)*100)
+	fmt.Printf("\tNode Commission Share Security Council Adder: %.2f%%\n", math.WeiToEth(response.Network.NodeCommissionShareSecurityCouncilAdder)*100)
+	fmt.Printf("\tVoter Share:                                  %.2f%%\n", math.WeiToEth(response.Network.VoterShare)*100)
+	fmt.Printf("\tProtocol DAO Share:                           %.2f%%\n", math.WeiToEth(response.Network.ProtocolDAOShare)*100)
+	fmt.Printf("\tMax Commission Share Security Council Adder:  %.2f%%\n", math.WeiToEth(response.Network.MaxNodeShareSecurityCouncilAdder)*100)
+	fmt.Printf("\tMax rETH balance delta:                       %.2f%%\n", math.WeiToEth(response.Network.MaxRethBalanceDelta)*100)
+	fmt.Printf("\tAllow listed controllers:                     %v\n", response.Network.AllowListedControllers)
+	fmt.Printf("\trETH Deposit Delay:                           %d Blocks\n", response.Network.RethDepositDelay)
+	fmt.Println()
+
+	// Node
+	fmt.Println("== Node Settings ==")
+	fmt.Printf("\tRegistration Enabled:          %t\n", response.Node.IsRegistrationEnabled)
+	fmt.Printf("\tSmoothing Pool Opt-In Enabled: %t\n", response.Node.IsSmoothingPoolRegistrationEnabled)
+	fmt.Printf("\tNode Deposits Enabled:         %t\n", response.Node.IsDepositingEnabled)
+	fmt.Printf("\tVacant Minipools Enabled:      %t\n", response.Node.AreVacantMinipoolsEnabled)
+	fmt.Printf("\tReduced Bond:                  %.6f ETH\n", response.Node.ReducedBond)
+	fmt.Printf("\tNode Unstaking Period:         %s\n", response.Node.NodeUnstakingPeriod)
+	fmt.Printf("\tWithdrawal Cooldown:           %s\n", response.Node.WithdrawalCooldown)
+	fmt.Printf("\tMax Stake For Voting Power:    %.2f%%\n", math.WeiToEth(response.Node.MaximumStakeForVotingPower)*100)
+	fmt.Printf("\tMin Legacy RPL Stake:          %s\n", response.Node.MinimumLegacyRplStake)
+	fmt.Println()
+
+	// Proposals
+	fmt.Println("== Proposal Settings ==")
+	fmt.Printf("\tVoting Window (Phase 1): %s\n", response.Proposals.VotePhase1Time)
+	fmt.Printf("\tVoting Window (Phase 2): %s\n", response.Proposals.VotePhase2Time)
+	fmt.Printf("\tVoting Start Delay:      %s\n", response.Proposals.VoteDelayTime)
+	fmt.Printf("\tExecute Window:          %s\n", response.Proposals.ExecuteTime)
+	fmt.Printf("\tBond per Proposal:       %.6f RPL\n", math.WeiToEth(response.Proposals.ProposalBond))
+	fmt.Printf("\tBond per Challenge:      %.6f RPL\n", math.WeiToEth(response.Proposals.ChallengeBond))
+	fmt.Printf("\tChallenge Response Time: %s\n", response.Proposals.ChallengePeriod)
+	fmt.Printf("\tQuorum:                  %.2f%%\n", math.WeiToEth(response.Proposals.Quorum)*100)
+	fmt.Printf("\tVeto Quorum:             %.2f%%\n", math.WeiToEth(response.Proposals.VetoQuorum)*100)
+	fmt.Printf("\tTarget Block Age Limit:  %d Blocks\n", response.Proposals.MaxBlockAge)
+	fmt.Println()
+
+	// Rewards
+	fmt.Println("== Rewards Settings ==")
+	fmt.Printf("\tInterval Length: %s\n", response.Rewards.IntervalTime)
+	fmt.Println()
+
+	// Security
+	fmt.Println("== Security Settings ==")
+	fmt.Printf("\tMember Quorum:         %.2f%%\n", math.WeiToEth(response.Security.MembersQuorum)*100)
+	fmt.Printf("\tMember Leave Time:     %s\n", response.Security.MembersLeaveTime)
+	fmt.Printf("\tProposal Vote Time:    %s\n", response.Security.ProposalVoteTime)
+	fmt.Printf("\tProposal Execute Time: %s\n", response.Security.ProposalExecuteTime)
+	fmt.Printf("\tProposal Action Time:  %s\n", response.Security.ProposalActionTime)
+	fmt.Printf("\tUpgrade Veto Quorum:   %.2f%%\n", math.WeiToEth(response.Security.UpgradeVetoQuorum)*100)
+	fmt.Printf("\tUpgrade Delay:         %s\n", response.Security.UpgradeDelay)
+	fmt.Println()
+
+	if response.Saturn2Deployed {
+		// Performance
+		fmt.Println("== Performance Settings ==")
+		fmt.Printf("\tPerformance Exits Enabled:   %t\n", response.Performance.ExitsEnabled)
+		fmt.Printf("\tPerformance Period:          %d Epochs\n", response.Performance.Period)
+		fmt.Printf("\tProof Buffer:                %d Epochs\n", response.Performance.ProofBuffer)
+		fmt.Printf("\tPerformance Threshold:       %.2f%%\n", math.WeiToEth(response.Performance.Threshold)*100)
+		fmt.Printf("\tChallenge Period:            %s\n", response.Performance.ChallengePeriod)
+		fmt.Printf("\tChallenge Bond:              %.6f RPL\n", math.WeiToEth(response.Performance.ChallengeBond))
+		fmt.Println()
+
+		// Exit
+		fmt.Println("== Exit Settings (RPIP-80) ==")
+		fmt.Printf("\tCooperative Exit Phase:      %.0f Hours\n", response.Exit.CooperativeExitPhase.Hours())
+		fmt.Printf("\tDid Not Exit Penalty Base:   %.6f ETH\n", math.WeiToEth(response.Exit.DidNotExitPenaltyBase))
+		fmt.Printf("\tDid Not Exit Base:           %s\n", response.Exit.DidNotExitBase)
+		fmt.Printf("\tDid Not Exit Backoff:        %.2fx\n", math.WeiToEth(response.Exit.DidNotExitBackoff))
+		fmt.Println()
+	}
+
+	// Megapool
+	fmt.Println("== Megapool Settings ==")
+	fmt.Printf("\tTime Before Dissolve:                   %s\n", response.Megapool.TimeBeforeDissolve)
+	fmt.Printf("\tDissolve Penalty:                       %.6f ETH\n", math.WeiToEth(response.Megapool.DissolvePenalty))
+	fmt.Printf("\tMax ETH penalty:                        %.6f ETH\n", math.WeiToEth(response.Megapool.MaximumEthPenalty))
+	fmt.Printf("\tNotify Threshold:                       %d Epochs\n", response.Megapool.NotifyThreshold)
+	fmt.Printf("\tLate Notify Fine:                       %.6f ETH\n", math.WeiToEth(response.Megapool.LateNotifyFine))
+	fmt.Printf("\tUser Distribute Delay:                  %d Epochs\n", response.Megapool.UserDistributeDelay)
+	fmt.Printf("\tUser Distribute Delay with Shortfall:   %d Epochs\n", response.Megapool.UserDistributeDelayWithShortfall)
+	fmt.Printf("\tPenalty Threshold:                      %.2f%%\n", math.WeiToEth(response.Megapool.PenaltyThreshold)*100)
+	if response.Saturn2Deployed {
+		fmt.Printf("\tExit Deficit:                           %.6f ETH\n", math.WeiToEth(response.Megapool.ExitDeficit))
+	}
+
+	return nil
+}

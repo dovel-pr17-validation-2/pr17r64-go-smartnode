@@ -1,0 +1,125 @@
+package pdao
+
+import (
+	"fmt"
+
+	cliutils "github.com/rocket-pool/smartnode/rocketpool-cli/cli"
+	"github.com/rocket-pool/smartnode/rocketpool-cli/cli/prompt"
+	"github.com/rocket-pool/smartnode/shared/math"
+	"github.com/rocket-pool/smartnode/shared/services/gas"
+	"github.com/rocket-pool/smartnode/shared/services/rocketpool"
+)
+
+func getRewardsPercentages() error {
+	// Get RP client
+	rp, err := rocketpool.NewClient().WithReady()
+	if err != nil {
+		return err
+	}
+	defer rp.Close()
+
+	// Get all PDAO settings
+	response, err := rp.PDAOGetRewardsPercentages()
+	if err != nil {
+		return err
+	}
+
+	// Print the settings
+	fmt.Printf("Node Operators: %.2f%% (%s)\n", math.WeiToEth(response.Node)*100, response.Node.String())
+	fmt.Printf("Oracle DAO:     %.2f%% (%s)\n", math.WeiToEth(response.OracleDao)*100, response.OracleDao.String())
+	fmt.Printf("Protocol DAO:   %.2f%% (%s)\n", math.WeiToEth(response.ProtocolDao)*100, response.ProtocolDao.String())
+	return nil
+}
+
+func proposeRewardsPercentages(rawEnabled bool, nodeFlag string, odaoFlag string, pdaoFlag string, yes bool) error {
+	// Get RP client
+	rp, err := rocketpool.NewClient().WithReady()
+	if err != nil {
+		return err
+	}
+	defer rp.Close()
+
+	// Get the node op percent
+	nodeString := nodeFlag
+	if nodeString == "" {
+		if rawEnabled {
+			nodeString = prompt.Prompt("Please enter the new rewards allocation for node operators (as an 18-decimal-fixed-point-integer (wei) value):", "^\\d+$", "Invalid amount")
+		} else {
+			nodeString = prompt.Prompt("Please enter the new rewards allocation for node operators as a percentage from 0 to 1:", "^\\d+(\\.\\d+)?$", "Invalid amount")
+		}
+	}
+	nodePercent, err := cliutils.ValidateFloat(rawEnabled, "node-percent", nodeString, true, yes)
+	if err != nil {
+		return err
+	}
+
+	// Get the oDAO percent
+	odaoString := odaoFlag
+	if odaoString == "" {
+		if rawEnabled {
+			odaoString = prompt.Prompt("Please enter the new rewards allocation for the Oracle DAO (as an 18-decimal-fixed-point-integer (wei) value):", "^\\d+$", "Invalid amount")
+		} else {
+			odaoString = prompt.Prompt("Please enter the new rewards allocation for the Oracle DAO as a percentage from 0 to 1:", "^\\d+(\\.\\d+)?$", "Invalid amount")
+		}
+	}
+	odaoPercent, err := cliutils.ValidateFloat(rawEnabled, "odao-percent", odaoString, true, yes)
+	if err != nil {
+		return err
+	}
+
+	// Get the pDAO percent
+	pdaoString := pdaoFlag
+	if pdaoString == "" {
+		if rawEnabled {
+			pdaoString = prompt.Prompt("Please enter the new rewards allocation for the Protocol DAO treasury (as an 18-decimal-fixed-point-integer (wei) value):", "^\\d+$", "Invalid amount")
+		} else {
+			pdaoString = prompt.Prompt("Please enter the new rewards allocation for the Protocol DAO treasury as a percentage from 0 to 1:", "^\\d+(\\.\\d+)?$", "Invalid amount")
+		}
+	}
+	pdaoPercent, err := cliutils.ValidateFloat(rawEnabled, "pdao-percent", pdaoString, true, yes)
+	if err != nil {
+		return err
+	}
+
+	// Check submissions
+	canResponse, err := rp.PDAOCanProposeRewardsPercentages(nodePercent, odaoPercent, pdaoPercent)
+	if err != nil {
+		return err
+	}
+	if !canResponse.CanPropose {
+		fmt.Println("Cannot propose rewards percentages:")
+		if canResponse.IsRplLockingDisallowed {
+			fmt.Println("Please enable RPL locking using the command 'rocketpool node allow-rpl-locking' to raise proposals.")
+		}
+		return nil
+	}
+
+	// Assign max fee
+	err = gas.AssignMaxFeeAndLimit(canResponse.GasLimits, rp, yes)
+	if err != nil {
+		return err
+	}
+
+	// Prompt for confirmation
+	if prompt.Declined(yes, "Are you sure you want to propose new rewards allocations?") {
+		fmt.Println("Cancelled.")
+		return nil
+	}
+
+	// Submit
+	response, err := rp.PDAOProposeRewardsPercentages(nodePercent, odaoPercent, pdaoPercent, canResponse.BlockNumber)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Proposing new allocations...\n")
+	cliutils.PrintTransactionHash(rp, response.TxHash)
+	if _, err = rp.WaitForTransaction(response.TxHash); err != nil {
+		return err
+	}
+
+	// Log & return
+	fmt.Println("Proposal successfully created.")
+	return nil
+
+}

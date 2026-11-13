@@ -1,0 +1,152 @@
+package pdao
+
+import (
+	"fmt"
+	"sort"
+	"strconv"
+
+	"github.com/rocket-pool/smartnode/bindings/transactions/gaslimit"
+
+	cliutils "github.com/rocket-pool/smartnode/rocketpool-cli/cli"
+	"github.com/rocket-pool/smartnode/rocketpool-cli/cli/prompt"
+	"github.com/rocket-pool/smartnode/shared/math"
+	"github.com/rocket-pool/smartnode/shared/services/gas"
+	"github.com/rocket-pool/smartnode/shared/services/rocketpool"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func claimBonds(proposal string, yes bool) error {
+
+	// Get RP client
+	rp, err := rocketpool.NewClient().WithReady()
+	if err != nil {
+		return err
+	}
+	defer rp.Close()
+
+	// Get protocol DAO proposals
+	claimableBondsResponse, err := rp.PDAOGetClaimableBonds()
+	if err != nil {
+		return fmt.Errorf("error checking for claimable bonds: %w", err)
+	}
+	claimableBonds := claimableBondsResponse.ClaimableBonds
+
+	// Check for executable proposals
+	if len(claimableBonds) == 0 {
+		fmt.Println("You do not have any unlockable bonds or claimable rewards.")
+		return nil
+	}
+
+	// Get selected proposal
+	var selectedClaims []api.BondClaimResult
+	if proposal == "all" {
+
+		// Select all proposals
+		selectedClaims = claimableBonds
+
+	} else if proposal != "" {
+
+		// Get selected proposal ID
+		selectedId, err := strconv.ParseUint(proposal, 10, 64)
+		if err != nil {
+			return fmt.Errorf("Invalid proposal ID '%s': %w", proposal, err)
+		}
+
+		// Get matching proposal
+		found := false
+		for _, bond := range claimableBonds {
+			if bond.ProposalID == selectedId {
+				selectedClaims = []api.BondClaimResult{bond}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("Proposal %d does not have any unlockable bonds or claimable rewards.", selectedId)
+		}
+
+	} else {
+
+		// Prompt for proposal selection
+		options := make([]string, len(claimableBonds)+1)
+		options[0] = "All available proposals"
+		for pi, bond := range claimableBonds {
+			options[pi+1] = fmt.Sprintf("Proposal %d (proposer: %t, unlockable: %.2f RPL, rewards: %.2f RPL)", bond.ProposalID, bond.IsProposer, math.WeiToEth(bond.UnlockAmount), math.WeiToEth(bond.RewardAmount))
+		}
+		selected, _ := prompt.Select("Please select a proposal to unlock bonds / claim rewards from:", options)
+
+		// Get proposals
+		if selected == 0 {
+			selectedClaims = claimableBonds
+		} else {
+			selectedClaims = []api.BondClaimResult{claimableBonds[selected-1]}
+		}
+
+	}
+
+	// Get the total gas limit estimate
+	var gasLimits gaslimit.Limits
+	for _, bond := range selectedClaims {
+		indices := getClaimIndicesForBond(bond)
+		canResponse, err := rp.PDAOCanClaimBonds(bond.ProposalID, indices)
+		if err != nil {
+			return fmt.Errorf("error simulating claim-bond on proposal %d: %s", bond.ProposalID, err.Error())
+		}
+		gasLimits = gasLimits.Add(canResponse.GasLimits)
+	}
+
+	// Assign max fees
+	err = gas.AssignMaxFeeAndLimit(gasLimits, rp, yes)
+	if err != nil {
+		return err
+	}
+
+	// Prompt for confirmation
+	if prompt.Declined(yes, "Are you sure you want to claim bonds and rewards from %d proposals?", len(selectedClaims)) {
+		fmt.Println("Cancelled.")
+		return nil
+	}
+
+	// Claim bonds from proposals
+	for _, bond := range selectedClaims {
+		indices := getClaimIndicesForBond(bond)
+		response, err := rp.PDAOClaimBonds(bond.IsProposer, bond.ProposalID, indices)
+		if err != nil {
+			fmt.Printf("Could not claim bonds from proposal %d: %s.\n", bond.ProposalID, err)
+			continue
+		}
+
+		fmt.Printf("Claiming bonds from proposal %d...\n", bond.ProposalID)
+		cliutils.PrintTransactionHash(rp, response.TxHash)
+		if _, err = rp.WaitForTransaction(response.TxHash); err != nil {
+			fmt.Printf("Could not claim bonds from proposal %d: %s.\n", bond.ProposalID, err)
+		} else {
+			fmt.Printf("Successfully claimed bonds from proposal %d.\n", bond.ProposalID)
+		}
+	}
+
+	// Return
+	return nil
+
+}
+
+func getClaimIndicesForBond(bond api.BondClaimResult) []uint64 {
+	indexMap := map[uint64]bool{}
+	for _, index := range bond.UnlockableIndices {
+		indexMap[index] = true
+	}
+	for _, index := range bond.RewardableIndices {
+		indexMap[index] = true
+	}
+
+	indices := make([]uint64, 0, len(indexMap))
+	for index := range indexMap {
+		indices = append(indices, index)
+	}
+
+	sort.SliceStable(indices, func(i, j int) bool {
+		return indices[i] < indices[j]
+	})
+
+	return indices
+}

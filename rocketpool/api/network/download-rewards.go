@@ -1,0 +1,64 @@
+package network
+
+import (
+	"fmt"
+
+	"github.com/urfave/cli/v3"
+
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/services/rewards"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func downloadRewardsFile(c *cli.Command, interval uint64) (*api.DownloadRewardsFileResponse, error) {
+
+	// Get services
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.DownloadRewardsFileResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the event info for the interval
+	intervalInfo, err := rewards.GetIntervalInfo(rp, cfg, nodeAccount.Address, interval, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error getting interval %d info: %w", interval, err)
+	}
+
+	// Download the rewards file
+	err = intervalInfo.DownloadRewardsFile(cfg, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return response
+	return &response, nil
+}
+
+func downloadRewardsFileHandler(ctx snroute.WriteContext) {
+	interval, err := parseUint64Param(ctx.Request, "interval")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := downloadRewardsFile(ctx.Command(), interval)
+	response.WriteResponse(ctx.Writer, resp, err)
+}

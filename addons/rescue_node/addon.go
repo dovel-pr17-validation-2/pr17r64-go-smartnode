@@ -1,0 +1,198 @@
+package rescue_node
+
+import (
+	"bytes"
+	"encoding/base64"
+	"fmt"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/rocket-pool/smartnode/addons/rescue_node/pb"
+	"github.com/rocket-pool/smartnode/rocketpool-cli/cli/color"
+	"github.com/rocket-pool/smartnode/shared/types/addons"
+	cfgtypes "github.com/rocket-pool/smartnode/shared/types/config"
+)
+
+const (
+	soloAuthValidity = 10 * time.Hour * 24
+	rpAuthValidity   = 15 * time.Hour * 24
+)
+
+type credentialDetails struct {
+	solo   bool
+	issued time.Time
+}
+
+func (c *credentialDetails) GetTimeLeft() time.Duration {
+
+	if c.solo {
+		return time.Until(c.issued.Add(soloAuthValidity))
+	}
+
+	return time.Until(c.issued.Add(rpAuthValidity))
+}
+
+type RescueNode struct {
+	cfg *RescueNodeConfig `yaml:"config,omitempty"`
+}
+
+func NewRescueNode() addons.SmartnodeAddon {
+	return &RescueNode{
+		cfg: NewConfig(),
+	}
+}
+
+func (r *RescueNode) GetName() string {
+	return "Rescue Node"
+}
+
+func (r *RescueNode) GetConfig() cfgtypes.Config {
+	return r.cfg
+}
+
+func (r *RescueNode) GetContainerName() string {
+	return ""
+}
+
+func (r *RescueNode) GetContainerTag() string {
+	return ""
+}
+
+func (r *RescueNode) GetDescription() string {
+	return `Rocket Rescue Node
+
+The Rocket Rescue Node is a community-run, trust-minimized, and secured fallback node for emergencies and maintenance.
+
+For more information, see https://rescuenode.com`
+}
+
+func (r *RescueNode) GetEnabledParameter() *cfgtypes.Parameter {
+	return &r.cfg.Enabled
+}
+
+func (r *RescueNode) getCredentialDetails() (*credentialDetails, error) {
+	if !r.cfg.Enabled.Value.(bool) {
+		panic("getCredentialDetails() should not be called without checking if RN plugin is enabled")
+	}
+
+	password := r.cfg.Password.Value.(string)
+	if password == "" {
+		return nil, fmt.Errorf("Rescue Node enabled, but no Username provided")
+	}
+
+	protoBytes, err := base64.URLEncoding.DecodeString(password)
+	if err != nil {
+		return nil, fmt.Errorf("Rescue Node enabled, but Password is not valid - error decoding base64: %w", err)
+	}
+
+	// To avoid a dependency on Rescue Node code, we will parse the protobuf by hand.
+	msg := new(pb.AuthenticatedCredential)
+	err = proto.Unmarshal(protoBytes, msg)
+	if err != nil {
+		return nil, fmt.Errorf("Rescue Node enabled, but Password is not valid - error decoding proto: %w", err)
+	}
+
+	return &credentialDetails{
+		solo:   msg.Credential.OperatorType == pb.OperatorType_OT_SOLO,
+		issued: time.Unix(msg.Credential.Timestamp, 0),
+	}, nil
+}
+
+func (r *RescueNode) getCredentialNodeId() (*common.Address, error) {
+	if !r.cfg.Enabled.Value.(bool) {
+		panic("getCredentialNodeId() should not be called without checking if RN plugin is enabled")
+	}
+
+	username := r.cfg.Username.Value.(string)
+	if username == "" {
+		return nil, fmt.Errorf("Rescue Node enabled, but no Username provided")
+	}
+
+	addr, err := base64.URLEncoding.DecodeString(username)
+	if err != nil {
+		return nil, fmt.Errorf("Rescue Node enabled, but Username is not valid - error decoding base64: %w", err)
+	}
+
+	out := common.BytesToAddress(addr)
+	return &out, nil
+}
+
+func (r *RescueNode) PrintStatusText(nodeAddr common.Address) {
+	if !r.cfg.Enabled.Value.(bool) {
+		return
+	}
+
+	color.YellowPrintln("=== Rescue Node Add-on Enabled ===")
+	// Check the Username
+	usernameNodeAddr, err := r.getCredentialNodeId()
+	if err != nil {
+		color.RedPrintln(err.Error())
+	} else {
+		fmt.Printf("Using a credential issued to %s.\n", color.LightBlue(usernameNodeAddr.String()))
+		if !bytes.Equal(usernameNodeAddr.Bytes(), nodeAddr.Bytes()) {
+			color.YellowPrintln(" - WARNING: This does not match the Node Account!")
+		}
+	}
+
+	credentialDetails, err := r.getCredentialDetails()
+	if err != nil {
+		color.RedPrintln(err.Error())
+	} else {
+		if credentialDetails.solo {
+			color.YellowPrintln(" - WARNING: This credential was issued to a solo staker!")
+		}
+
+		timeLeft := credentialDetails.GetTimeLeft().Truncate(time.Second)
+		if timeLeft < 0 {
+			color.RedPrintf("WARNING: This credential expired %s ago!\n", timeLeft.String())
+		} else if timeLeft < time.Hour*24 {
+			color.YellowPrintf("WARNING: This credential expires in %s!\n", timeLeft.String())
+		} else {
+			color.GreenPrintf("This credential expires in %s.\n", timeLeft.String())
+		}
+	}
+}
+
+type RescueNodeOverrides struct {
+	CcApiEndpoint     string
+	CcRpcEndpoint     string
+	VcAdditionalFlags string
+}
+
+func (r *RescueNode) GetOverrides(cc cfgtypes.ConsensusClient) (*RescueNodeOverrides, error) {
+	if !r.cfg.Enabled.Value.(bool) {
+		return nil, nil
+	}
+
+	username := r.cfg.Username.Value.(string)
+	password := r.cfg.Password.Value.(string)
+
+	if username == "" || password == "" {
+		return nil, fmt.Errorf("Rescue Node can not be enabled without a Username and Password configured.")
+	}
+
+	switch cc {
+	case cfgtypes.ConsensusClient_Unknown:
+		return nil, fmt.Errorf("Unable to generate rescue node URLs for unknown consensus client")
+	case cfgtypes.ConsensusClient_Lighthouse,
+		cfgtypes.ConsensusClient_Nimbus,
+		cfgtypes.ConsensusClient_Lodestar,
+		cfgtypes.ConsensusClient_Teku:
+
+		rescueURL := fmt.Sprintf("https://%s:%s@%s.rescuenode.com", username, password, cc)
+
+		return &RescueNodeOverrides{
+			CcApiEndpoint: rescueURL,
+		}, nil
+	case cfgtypes.ConsensusClient_Prysm:
+
+		return &RescueNodeOverrides{
+			CcRpcEndpoint:     "prysm-grpc.rescuenode.com:443",
+			VcAdditionalFlags: fmt.Sprintf("--grpc-headers=rprnauth=%s:%s --tls-cert=/etc/ssl/certs/ca-certificates.crt", username, password),
+		}, nil
+	}
+
+	return nil, nil
+}

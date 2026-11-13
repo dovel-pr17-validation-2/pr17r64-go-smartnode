@@ -1,0 +1,352 @@
+package config
+
+import (
+	"fmt"
+	"slices"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
+
+	cfgtypes "github.com/rocket-pool/smartnode/shared/types/config"
+)
+
+// A layout container with the standard elements and design
+type standardLayout struct {
+	grid              *tview.Grid
+	content           tview.Primitive
+	descriptionBox    *tview.TextView
+	errorAlert        *tview.TextView
+	footer            tview.Primitive
+	form              *Form
+	parameters        map[tview.FormItem]*parameterizedFormItem
+	commitErrorActive bool
+}
+
+// Creates a new StandardLayout instance, which includes the grid and description box preconstructed.
+func newStandardLayout() *standardLayout {
+
+	// Create the main display grid
+	grid := tview.NewGrid().
+		SetColumns(-5, 2, -3).
+		SetRows(0, 1, 0).
+		SetBorders(false)
+
+	// Create the description box
+	descriptionBox := tview.NewTextView()
+	descriptionBox.SetBorder(true)
+	descriptionBox.SetBorderPadding(0, 0, 1, 1)
+	descriptionBox.SetTitle(" Description ")
+	descriptionBox.SetWordWrap(true)
+	descriptionBox.SetBackgroundColor(tview.Styles.ContrastBackgroundColor)
+	descriptionBox.SetDynamicColors(true)
+
+	grid.AddItem(descriptionBox, 0, 2, 1, 1, 0, 0, false)
+
+	return &standardLayout{
+		grid:           grid,
+		descriptionBox: descriptionBox,
+	}
+
+}
+
+// Sets the main content (the box on the left side of the screen) for this layout,
+// applying the default styles to it.
+func (layout *standardLayout) setContent(content tview.Primitive, contentBox *tview.Box, title string) {
+
+	// Set the standard properties for the content (border and title)
+	contentBox.SetBorder(true)
+	contentBox.SetBorderPadding(1, 1, 1, 1)
+	contentBox.SetTitle(fmt.Sprintf(" %s ", title))
+
+	// Add the content to the grid
+	layout.content = content
+	layout.grid.AddItem(content, 0, 0, 1, 1, 0, 0, true)
+}
+
+// Sets the footer for this layout.
+func (layout *standardLayout) setFooter(footer tview.Primitive, height int) {
+
+	if footer == nil {
+		layout.grid.SetRows(0, 1)
+	} else {
+		// Add the footer to the grid
+		layout.footer = footer
+		layout.grid.SetRows(0, 1, height)
+		layout.grid.AddItem(footer, 2, 0, 1, 3, 0, 0, false)
+	}
+
+}
+
+// Create a standard form for this layout (for settings pages)
+func (layout *standardLayout) createForm(networkParam *cfgtypes.Parameter, title string) {
+
+	layout.parameters = map[tview.FormItem]*parameterizedFormItem{}
+
+	// Create the form
+	form := NewForm().
+		SetFieldBackgroundColor(tcell.ColorBlack)
+	form.
+		SetBackgroundColor(tview.Styles.ContrastBackgroundColor).
+		SetBorderPadding(0, 0, 0, 0)
+
+	// Set up the selected parameter change callback to update the description box
+	form.SetChangedFunc(func(index int) {
+		if index < form.GetFormItemCount() {
+			formItem := form.GetFormItem(index)
+			param := layout.parameters[formItem].parameter
+			defaultValue, _ := param.GetDefault(networkParam.Value.(cfgtypes.Network))
+			descriptionText := fmt.Sprintf("Default: %v\n\n%s", defaultValue, param.Description)
+			if param.ID == "containerTag" {
+				if fmt.Sprint(param.Value) == fmt.Sprint(defaultValue) {
+					descriptionText = "This is the default version of this service for the current Smart Node release.\n\n" + param.Description
+				} else {
+					descriptionText = fmt.Sprintf("The default version for this service is %v.\n\n%s", defaultValue, param.Description)
+				}
+			}
+			layout.descriptionBox.SetText(descriptionText)
+			layout.descriptionBox.ScrollToBeginning()
+		}
+	})
+
+	layout.form = form
+	layout.form.SetNavigationBlocked(func() bool {
+		return layout.commitErrorActive
+	})
+	layout.setContent(form, form.Box, title)
+	layout.createSettingFooter()
+}
+
+// Refreshes all of the form items to show the current configured values
+func (layout *standardLayout) refresh() {
+
+	for i := 0; i < layout.form.GetFormItemCount(); i++ {
+		formItem := layout.form.GetFormItem(i)
+		param := layout.parameters[formItem].parameter
+
+		// Set the form item to the current value
+		switch param.Type {
+		case cfgtypes.ParameterType_Bool:
+			formItem.(*tview.Checkbox).SetChecked(param.Value == true)
+
+		case cfgtypes.ParameterType_Int, cfgtypes.ParameterType_Uint, cfgtypes.ParameterType_Uint16, cfgtypes.ParameterType_String, cfgtypes.ParameterType_Float:
+			formItem.(*tview.InputField).SetText(fmt.Sprint(param.Value))
+
+		case cfgtypes.ParameterType_Choice:
+			dropDown := formItem.(*DropDown)
+			optionsChanged := len(dropDown.options) != len(param.Options)
+			for i, option := range param.Options {
+				if i >= len(dropDown.options) || dropDown.options[i].Text != option.Name {
+					optionsChanged = true
+					break
+				}
+			}
+			if optionsChanged {
+				names := make([]string, len(param.Options))
+				for i, option := range param.Options {
+					names[i] = option.Name
+				}
+				dropDown.SetOptions(names, dropDown.selected)
+				dropDown.currentOption = -1
+			}
+			for i := 0; i < len(param.Options); i++ {
+				if param.Options[i].Value == param.Value {
+					formItem.(*DropDown).SetCurrentOption(i)
+				}
+			}
+		}
+	}
+
+	// Focus the first element
+	layout.form.SetFocus(0)
+
+}
+
+// Shows an error alert at the bottom of the screen, or clears it when message is empty.
+func (layout *standardLayout) showCommitError(message string) {
+	layout.commitErrorActive = message != ""
+	if layout.errorAlert == nil {
+		return
+	}
+	if message == "" {
+		layout.errorAlert.SetText("")
+		return
+	}
+	layout.errorAlert.SetText("[red::b]" + message + "[-:-:-]")
+}
+
+func (layout *standardLayout) commitFocusedInputField() {
+	for _, param := range layout.parameters {
+		if _, ok := param.item.(*tview.InputField); ok && param.item.HasFocus() {
+			param.commit()
+			return
+		}
+	}
+}
+
+func (layout *standardLayout) navCapture(event *tcell.EventKey) *tcell.EventKey {
+	if layout.commitErrorActive {
+		switch event.Key() {
+		case tcell.KeyDown, tcell.KeyTab:
+			layout.commitFocusedInputField()
+			if layout.commitErrorActive {
+				return nil
+			}
+			return tcell.NewEventKey(tcell.KeyTab, 0, 0)
+		case tcell.KeyUp, tcell.KeyBacktab:
+			return nil
+		}
+		return event
+	}
+	switch event.Key() {
+	case tcell.KeyDown, tcell.KeyTab:
+		return tcell.NewEventKey(tcell.KeyTab, 0, 0)
+	case tcell.KeyUp, tcell.KeyBacktab:
+		return tcell.NewEventKey(tcell.KeyBacktab, 0, 0)
+	}
+	return event
+}
+
+func (layout *standardLayout) setItemNavCapture(item *parameterizedFormItem) {
+	capture := layout.navCapture
+	switch el := item.item.(type) {
+	case *tview.Checkbox:
+		el.SetInputCapture(capture)
+	case *tview.InputField:
+		el.SetInputCapture(capture)
+	case *DropDown:
+		el.SetInputCapture(capture)
+	}
+}
+
+// Create the footer, including the nav bar
+func (layout *standardLayout) createSettingFooter() {
+
+	layout.errorAlert = tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignCenter).
+		SetWrap(false).
+		SetRegions(false)
+	layout.errorAlert.SetBackgroundColor(tview.Styles.ContrastBackgroundColor)
+
+	// Nav bar
+	navString1 := "Arrow keys: Navigate   Space/Enter: Change Setting"
+	navTextView1 := tview.NewTextView().
+		SetDynamicColors(false).
+		SetRegions(false).
+		SetWrap(false)
+	_, err := fmt.Fprint(navTextView1, navString1)
+	if err != nil {
+		panic(fmt.Errorf("error writing nav string 1: %w", err))
+	}
+
+	navString2 := "Esc: Go Back (saves changes)"
+	navTextView2 := tview.NewTextView().
+		SetDynamicColors(false).
+		SetRegions(false).
+		SetWrap(false)
+	_, err = fmt.Fprint(navTextView2, navString2)
+	if err != nil {
+		panic(fmt.Errorf("error writing nav string 2: %w", err))
+	}
+
+	navBar := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(tview.NewFlex().
+			AddItem(tview.NewBox(), 0, 1, false).
+			AddItem(navTextView1, len(navString1), 1, false).
+			AddItem(tview.NewBox(), 0, 1, false),
+			1, 1, false).
+		AddItem(tview.NewFlex().
+			AddItem(tview.NewBox(), 0, 1, false).
+			AddItem(navTextView2, len(navString2), 1, false).
+			AddItem(tview.NewBox(), 0, 1, false),
+			1, 1, false)
+
+	footer := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(layout.errorAlert, 1, 0, false).
+		AddItem(navBar, 2, 1, false)
+
+	layout.setFooter(footer, 3)
+
+}
+
+// Add a collection of form items to this layout's form
+func (layout *standardLayout) addFormItems(params []*parameterizedFormItem) {
+	for _, param := range params {
+		layout.form.AddFormItem(param.item)
+	}
+}
+
+// Add a collection of "common" and "specific" form items to this layout's form, where some of the common
+// items may not be valid and should be excluded
+func (layout *standardLayout) addFormItemsWithCommonParams(commonParams []*parameterizedFormItem, specificParams []*parameterizedFormItem, unsupportedCommonParams []string) {
+
+	// Add the common params if they aren't in the unsupported list
+	for _, commonParam := range commonParams {
+		isSupported := true
+		if slices.Contains(unsupportedCommonParams, commonParam.parameter.ID) {
+			isSupported = false
+		}
+
+		if isSupported {
+			layout.form.AddFormItem(commonParam.item)
+		}
+	}
+
+	// Add all of the specific params
+	for _, specificParam := range specificParams {
+		layout.form.AddFormItem(specificParam.item)
+	}
+
+}
+
+func (layout *standardLayout) mapParameterizedFormItems(params ...*parameterizedFormItem) {
+	for _, param := range params {
+		if layout != nil {
+			param.onCommitError = layout.showCommitError
+			layout.setItemNavCapture(param)
+		}
+		layout.parameters[param.item] = param
+	}
+}
+
+func (layout *standardLayout) getInputCapture(md *MainDisplay, prev *page) func(event *tcell.EventKey) *tcell.EventKey {
+	return func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			// Close all dropdowns and break if one was open
+			// Save the current modifications to text parameters
+			for _, param := range layout.parameters {
+				formItem := param.item
+				if !formItem.HasFocus() {
+					continue
+				}
+
+				// Close the dropdown if this field is one and it is open
+				if dropDown, ok := param.item.(*DropDown); ok && dropDown.open {
+					dropDown.CloseList(md.app)
+					return nil
+				}
+
+				// Save the text if this field is one
+				if _, ok := param.item.(*tview.InputField); ok {
+					layout.commitFocusedInputField()
+					break
+				}
+			}
+
+			if layout.commitErrorActive {
+				return nil
+			}
+
+			md.setPage(prev)
+			return nil
+		}
+		return event
+	}
+}
+
+// Sets up a handler to return to the specified homePage when the user presses escape on the layout.
+func (layout *standardLayout) setupEscapeReturnHomeHandler(md *MainDisplay, homePage *page) {
+	layout.grid.SetInputCapture(layout.getInputCapture(md, homePage))
+}

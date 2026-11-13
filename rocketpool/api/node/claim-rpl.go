@@ -1,0 +1,127 @@
+package node
+
+import (
+	"fmt"
+	"math/big"
+
+	"github.com/urfave/cli/v3"
+
+	"github.com/rocket-pool/smartnode/bindings/legacy/v1.0.0/rewards"
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func canNodeClaimRpl(c *cli.Command) (*api.CanNodeClaimRplResponse, error) {
+
+	// Get services
+	if err := services.RequireNodeWallet(c); err != nil {
+		return nil, err
+	}
+	if err := services.RequireRocketStorage(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.CanNodeClaimRplResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for rewards
+	legacyClaimNodeAddress := cfg.Smartnode.GetV100ClaimNodeAddress()
+	legacyRewardsPoolAddress := cfg.Smartnode.GetV100RewardsPoolAddress()
+	rewardsAmountWei, err := rewards.GetNodeClaimRewardsAmount(rp, nodeAccount.Address, nil, &legacyClaimNodeAddress)
+	if err != nil {
+		return nil, fmt.Errorf("Error getting RPL rewards amount: %w", err)
+	}
+	response.RplAmount = rewardsAmountWei
+
+	// Don't claim unless the oDAO has claimed first (prevent known issue yet to be patched in smart contracts)
+	trustedNodeClaimed, err := rewards.GetTrustedNodeTotalClaimed(rp, nil, &legacyRewardsPoolAddress)
+	if err != nil {
+		return nil, fmt.Errorf("Error checking if trusted node has already minted RPL: %w", err)
+	}
+	if trustedNodeClaimed.Cmp(big.NewInt(0)) == 0 {
+		response.RplAmount = big.NewInt(0)
+	}
+
+	// Get gas estimate
+	opts, err := w.GetNodeAccountTransactor()
+	if err != nil {
+		return nil, err
+	}
+	gasLimits, err := rewards.EstimateClaimNodeRewardsGas(rp, opts, &legacyClaimNodeAddress)
+	if err != nil {
+		return nil, fmt.Errorf("Could not estimate the gas required to claim RPL: %w", err)
+	}
+	response.GasLimits = gasLimits
+
+	return &response, nil
+}
+
+func nodeClaimRpl(c *cli.Command, t *snroute.TransactOpts) (*api.NodeClaimRplResponse, error) {
+	opts := t.Opts()
+
+	// Get services
+	if err := services.RequireNodeWallet(c); err != nil {
+		return nil, err
+	}
+	if err := services.RequireRocketStorage(c); err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.NodeClaimRplResponse{}
+
+	// Claim rewards
+	legacyClaimNodeAddress := cfg.Smartnode.GetV100ClaimNodeAddress()
+	hash, err := rewards.ClaimNodeRewards(rp, opts, &legacyClaimNodeAddress)
+	if err != nil {
+		return nil, err
+	}
+	response.TxHash = hash
+
+	// Return response
+	return &response, nil
+
+}
+
+func canClaimRplRewardsHandler(ctx snroute.Context) {
+	resp, err := canNodeClaimRpl(ctx.Command())
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func claimRplRewardsHandler(ctx snroute.WriteContext) {
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := nodeClaimRpl(ctx.Command(), opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}

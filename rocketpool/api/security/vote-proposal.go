@@ -1,0 +1,165 @@
+package security
+
+import (
+	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/rocket-pool/smartnode/bindings/dao"
+	"github.com/rocket-pool/smartnode/bindings/dao/security"
+	rptypes "github.com/rocket-pool/smartnode/bindings/types"
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func canVoteOnProposal(c *cli.Command, proposalId uint64) (*api.SecurityCanVoteOnProposalResponse, error) {
+
+	// Get services
+	if err := services.RequireNodeSecurityMember(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.SecurityCanVoteOnProposalResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Data
+	var wg errgroup.Group
+	var memberJoinedTime uint64
+	var proposalCreatedTime uint64
+
+	// Check proposal exists
+	wg.Go(func() error {
+		proposalCount, err := dao.GetProposalCount(rp, nil)
+		if err == nil {
+			response.DoesNotExist = (proposalId > proposalCount)
+		}
+		return err
+	})
+
+	// Check proposal state
+	wg.Go(func() error {
+		proposalState, err := dao.GetProposalState(rp, proposalId, nil)
+		if err == nil {
+			response.InvalidState = (proposalState != rptypes.Active)
+		}
+		return err
+	})
+
+	// Check if member has already voted
+	wg.Go(func() error {
+		hasVoted, err := dao.GetProposalMemberVoted(rp, proposalId, nodeAccount.Address, nil)
+		if err == nil {
+			response.AlreadyVoted = hasVoted
+		}
+		return err
+	})
+
+	// Get member joined time
+	wg.Go(func() error {
+		var err error
+		memberJoinedTime, err = security.GetMemberJoinedTime(rp, nodeAccount.Address, nil)
+		return err
+	})
+
+	// Get proposal created time
+	wg.Go(func() error {
+		var err error
+		proposalCreatedTime, err = dao.GetProposalCreatedTime(rp, proposalId, nil)
+		return err
+	})
+
+	// Get gas estimate
+	wg.Go(func() error {
+		opts, err := w.GetNodeAccountTransactor()
+		if err != nil {
+			return err
+		}
+		gasLimits, err := security.EstimateVoteOnProposalGas(rp, proposalId, false, opts)
+		if err == nil {
+			response.GasLimits = gasLimits
+		}
+		return err
+	})
+
+	// Wait for data
+	if err := wg.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Check data
+	response.JoinedAfterCreated = (memberJoinedTime >= proposalCreatedTime)
+
+	// Update & return response
+	response.CanVote = !response.DoesNotExist && !response.InvalidState && !response.JoinedAfterCreated && !response.AlreadyVoted
+	return &response, nil
+
+}
+
+func voteOnProposal(c *cli.Command, proposalId uint64, support bool, t *snroute.TransactOpts) (*api.SecurityVoteOnProposalResponse, error) {
+	opts := t.Opts()
+
+	// Get services
+	if err := services.RequireNodeSecurityMember(c); err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.SecurityVoteOnProposalResponse{}
+
+	// Vote on proposal
+	hash, err := security.VoteOnProposal(rp, proposalId, support, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.TxHash = hash
+
+	// Return response
+	return &response, nil
+
+}
+
+func canVoteProposalHandler(ctx snroute.Context) {
+	id, err := parseUint64(ctx.Request, "id")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := canVoteOnProposal(ctx.Command(), id)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func voteProposalHandler(ctx snroute.WriteContext) {
+	id, err := parseUint64(ctx.Request, "id")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	support := ctx.Request.FormValue("support") == "true"
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := voteOnProposal(ctx.Command(), id, support, opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}

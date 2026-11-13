@@ -1,0 +1,142 @@
+package auction
+
+import (
+	"fmt"
+	"strconv"
+
+	"github.com/rocket-pool/smartnode/bindings/transactions/gaslimit"
+
+	cliutils "github.com/rocket-pool/smartnode/rocketpool-cli/cli"
+	"github.com/rocket-pool/smartnode/rocketpool-cli/cli/prompt"
+	"github.com/rocket-pool/smartnode/shared/math"
+	"github.com/rocket-pool/smartnode/shared/services/gas"
+	"github.com/rocket-pool/smartnode/shared/services/rocketpool"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func recoverRplFromLot(lot string, yes bool) error {
+
+	// Get RP client
+	rp, err := rocketpool.NewClient().WithReady()
+	if err != nil {
+		return err
+	}
+	defer rp.Close()
+
+	// Get lot details
+	lots, err := rp.AuctionLots()
+	if err != nil {
+		return err
+	}
+
+	// Get recoverable lots
+	recoverableLots := []api.LotDetails{}
+	for _, lot := range lots.Lots {
+		if lot.RPLRecoveryAvailable {
+			recoverableLots = append(recoverableLots, lot)
+		}
+	}
+
+	// Check for recoverable lots
+	if len(recoverableLots) == 0 {
+		fmt.Println("No lots are available for RPL recovery.")
+		return nil
+	}
+
+	// Get selected lots
+	var selectedLots []api.LotDetails
+	if lot == "all" {
+
+		// Select all recoverable lots
+		selectedLots = recoverableLots
+
+	} else if lot != "" {
+
+		// Get selected lot index
+		selectedIndex, err := strconv.ParseUint(lot, 10, 64)
+		if err != nil {
+			return fmt.Errorf("Invalid lot ID '%s': %w", lot, err)
+		}
+
+		// Get matching lot
+		found := false
+		for _, lot := range recoverableLots {
+			if lot.Details.Index == selectedIndex {
+				selectedLots = []api.LotDetails{lot}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("Lot %d is not available for RPL recovery.", selectedIndex)
+		}
+
+	} else {
+
+		// Prompt for lot selection
+		options := make([]string, len(recoverableLots)+1)
+		options[0] = "All available lots"
+		for li, lot := range recoverableLots {
+			options[li+1] = fmt.Sprintf("lot %d (%.6f RPL unclaimed)", lot.Details.Index, math.RoundDown(math.WeiToEth(lot.Details.RemainingRPLAmount), 6))
+		}
+		selected, _ := prompt.Select("Please select a lot to recover unclaimed RPL from:", options)
+
+		// Get lots
+		if selected == 0 {
+			selectedLots = recoverableLots
+		} else {
+			selectedLots = []api.LotDetails{recoverableLots[selected-1]}
+		}
+
+	}
+
+	// Get the total gas limit estimate
+	var totalGas uint64
+	var totalSafeGas uint64
+	var gasLimits gaslimit.Limits
+	for _, lot := range selectedLots {
+		canResponse, err := rp.CanRecoverUnclaimedRPLFromLot(lot.Details.Index)
+		if err != nil {
+			return fmt.Errorf("Error checking if recovering lot %d is possible: %w", lot.Details.Index, err)
+		}
+		gasLimits = canResponse.GasLimits
+		totalGas += canResponse.GasLimits.Estimated
+		totalSafeGas += canResponse.GasLimits.Safe
+	}
+	gasLimits.Estimated = totalGas
+	gasLimits.Safe = totalSafeGas
+
+	// Get max fees
+	g, err := gas.GetMaxFeeAndLimit(gasLimits, rp, yes)
+	if err != nil {
+		return err
+	}
+
+	// Prompt for confirmation
+	if prompt.Declined(yes, "Are you sure you want to recover %d lots?", len(selectedLots)) {
+		fmt.Println("Cancelled.")
+		return nil
+	}
+
+	// Claim RPL from lots
+	for _, lot := range selectedLots {
+		g.Assign(rp)
+		response, err := rp.RecoverUnclaimedRPLFromLot(lot.Details.Index)
+		if err != nil {
+			fmt.Printf("Could not recover unclaimed RPL from lot %d: %s.\n", lot.Details.Index, err)
+			continue
+		}
+
+		fmt.Printf("Recovering lot %d...\n", lot.Details.Index)
+		cliutils.PrintTransactionHash(rp, response.TxHash)
+		if _, err = rp.WaitForTransaction(response.TxHash); err != nil {
+			fmt.Printf("Could not recover unclaimed RPL from lot %d: %s.\n", lot.Details.Index, err)
+		} else {
+			fmt.Printf("Successfully recovered unclaimed RPL from lot %d.\n", lot.Details.Index)
+		}
+	}
+
+	// Return
+	return nil
+
+}

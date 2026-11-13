@@ -1,0 +1,100 @@
+package network
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/fatih/color"
+	"github.com/urfave/cli/v3"
+
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/services/config"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+const (
+	NormalLogger = color.FgWhite
+	ErrorColor   = color.FgRed
+)
+
+func canGenerateRewardsTree(c *cli.Command, index uint64) (*api.CanNetworkGenerateRewardsTreeResponse, error) {
+
+	// Get services
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.CanNetworkGenerateRewardsTreeResponse{}
+
+	// Get the current interval
+	currentIndexBig, err := rp.GetRewardIndex(nil)
+	if err != nil {
+		return nil, err
+	}
+	response.CurrentIndex = currentIndexBig.Uint64()
+
+	// Get the path of the file to save
+	filePath := cfg.Smartnode.GetRewardsTreePath(index, true, config.RewardsExtensionJSON)
+	_, err = os.Stat(filePath)
+	if os.IsNotExist(err) {
+		response.TreeFileExists = false
+	} else {
+		response.TreeFileExists = true
+	}
+
+	return &response, nil
+
+}
+
+func generateRewardsTree(c *cli.Command, index uint64) (*api.NetworkGenerateRewardsTreeResponse, error) {
+
+	// Get services
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.NetworkGenerateRewardsTreeResponse{}
+
+	// Create the generation request
+	requestPath := cfg.Smartnode.GetRegenerateRewardsTreeRequestPath(index, true)
+	requestFile, err := os.Create(requestPath)
+	if requestFile != nil {
+		requestFile.Close()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("Error creating request marker: %w", err)
+	}
+
+	return &response, nil
+
+}
+
+func canGenerateRewardsTreeHandler(ctx snroute.Context) {
+	index, err := parseUint64Param(ctx.Request, "index")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := canGenerateRewardsTree(ctx.Command(), index)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func generateRewardsTreeHandler(ctx snroute.WriteContext) {
+	index, err := parseUint64Param(ctx.Request, "index")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := generateRewardsTree(ctx.Command(), index)
+	response.WriteResponse(ctx.Writer, resp, err)
+}

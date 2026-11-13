@@ -1,0 +1,641 @@
+package node
+
+import (
+	"context"
+	"fmt"
+	"math/big"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/fatih/color"
+	"github.com/urfave/cli/v3"
+
+	"github.com/rocket-pool/smartnode/bindings/utils"
+	"github.com/rocket-pool/smartnode/rocketpool/node/collectors"
+	log "github.com/rocket-pool/smartnode/shared/logger"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/services/alerting"
+	"github.com/rocket-pool/smartnode/shared/services/connectivity"
+	"github.com/rocket-pool/smartnode/shared/services/state"
+	"github.com/rocket-pool/smartnode/shared/services/wallet"
+	"github.com/rocket-pool/smartnode/shared/services/wallet/keystore/lighthouse"
+	"github.com/rocket-pool/smartnode/shared/services/wallet/keystore/nimbus"
+	"github.com/rocket-pool/smartnode/shared/services/wallet/keystore/prysm"
+	"github.com/rocket-pool/smartnode/shared/services/wallet/keystore/teku"
+)
+
+// Config
+var (
+	tasksInterval, _ = time.ParseDuration("5m")
+	taskCooldown, _  = time.ParseDuration("1s")
+)
+
+const (
+	MaxConcurrentEth1Requests = 200
+
+	// Keep exit requests in the scan for seven days after the cooperative phase.
+	exitRequestEnforcementWindow = 7 * 24 * time.Hour
+
+	DownloadRewardsTreesColor       = color.FgGreen
+	MetricsColor                    = color.FgHiYellow
+	ManageFeeRecipientColor         = color.FgHiCyan
+	DefendPdaoPropsColor            = color.FgYellow
+	VerifyPdaoPropsColor            = color.FgYellow
+	DistributeMinipoolsColor        = color.FgHiGreen
+	ErrorColor                      = color.FgRed
+	WarningColor                    = color.FgYellow
+	ObserveWarningColor             = color.FgHiRed
+	UpdateColor                     = color.FgHiWhite
+	PrestakeMegapoolValidatorColor  = color.FgHiGreen
+	StakeMegapoolValidatorColor     = color.FgHiBlue
+	NotifyValidatorExitColor        = color.FgHiYellow
+	NotifyFinalBalanceColor         = color.FgHiMagenta
+	CheckMinipoolExitRequestsColor  = color.FgHiCyan
+	CheckMegapoolExitRequestsColor  = color.FgCyan
+	DefendChallengeExitColor        = color.FgHiGreen
+	DefendChallengePerformanceColor = color.FgHiBlue
+	ProvisionExpressTickets         = color.FgMagenta
+	SetUseLatestDelegateColor       = color.FgBlue
+	CheckPortConnectivityColor      = color.FgHiYellow
+)
+
+// Register node command
+func RegisterCommands(app *cli.Command, name string, aliases []string) {
+	app.Commands = append(app.Commands, &cli.Command{
+		Name:    name,
+		Aliases: aliases,
+		Usage:   "Run Rocket Pool node activity daemon",
+		Action: func(ctx context.Context, c *cli.Command) error {
+			return run(c)
+		},
+	})
+}
+
+// Run daemon
+func run(c *cli.Command) error {
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return err
+	}
+	if err := cfg.ValidateNetworkForStart(); err != nil {
+		return err
+	}
+
+	if cfg.HasRocketPoolContracts() {
+		// Handle the initial fee recipient file deployment
+		err = deployDefaultFeeRecipientFile(c)
+		if err != nil {
+			return err
+		}
+
+		// Clean up old fee recipient files
+		err = removeLegacyFeeRecipientFiles(c)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Configure
+	configureHTTP()
+
+	// Print the current mode
+	if cfg.IsNativeMode {
+		fmt.Println("Starting node daemon in Native Mode.")
+	} else {
+		fmt.Println("Starting node daemon in Docker Mode.")
+	}
+
+	// Create a context that is cancelled on SIGINT/SIGTERM so the HTTP server
+	// and other background goroutines can shut down gracefully.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// Start the HTTP API server immediately so the CLI can reach it while
+	// the daemon waits for the wallet and services to become ready.
+	startHTTP(ctx, c, cfg)
+
+	if !cfg.HasRocketPoolContracts() {
+		fmt.Println("Rocket Pool contracts are not configured; running the HTTP API without node background tasks.")
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	for {
+		// Exit if the process received SIGINT/SIGTERM
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Check the EC status
+		err := services.WaitEthClientSynced(c, false) // Force refresh the primary / fallback EC status
+		if err != nil {
+			if !sleepWithContext(ctx, taskCooldown) {
+				return err
+			}
+			continue
+		}
+
+		// Check the BC status
+		err = services.WaitBeaconClientSynced(c, false) // Force refresh the primary / fallback BC status
+		if err != nil {
+			if !sleepWithContext(ctx, taskCooldown) {
+				return err
+			}
+			continue
+		}
+
+		break
+	}
+
+	// The real wallet is still required for fee recipient management in observe mode.
+	if err := services.WaitNodeHdWallet(ctx, c, true); err != nil {
+		return err
+	}
+
+	// Get services
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return err
+	}
+	isObserveMode := wallet.CheckObserveMode(cfg.Smartnode.GetNodeAddressPath())
+	var w wallet.Wallet
+	if isObserveMode {
+		w, err = services.GetWallet(c)
+	} else {
+		w, err = services.GetHdWallet(c)
+	}
+	if err != nil {
+		return err
+	}
+	// In observe mode, registration applies to the observed node, not the real wallet.
+	if err := services.WaitNodeRegisteredWithWallet(ctx, c, w, true); err != nil {
+		return err
+	}
+	bc, err := services.GetBeaconClient(c)
+	if err != nil {
+		return err
+	}
+
+	protocolVersion, err := utils.GetCurrentVersion(rp, nil)
+	if err != nil {
+		return fmt.Errorf("error getting protocol version: %w", err)
+	}
+
+	fmt.Printf("Protocol version: %s\n", protocolVersion)
+
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return fmt.Errorf("error getting node account: %w", err)
+	}
+
+	// Initialize loggers
+	errorLog := log.NewColorLogger(ErrorColor)
+	updateLog := log.NewColorLogger(UpdateColor)
+	observeLog := log.NewColorLogger(ObserveWarningColor)
+
+	// Create the state provider. In live mode this is a NetworkStateManager
+	// backed by the real EC/BC; in --network-state mode it is a
+	// StaticNetworkStateProvider that serves from the pre-loaded snapshot.
+	var m state.NetworkStateProvider
+	if services.IsStaticStateMode(c) {
+		m, err = services.GetNetworkStateProvider(c)
+		if err != nil {
+			return fmt.Errorf("error getting network state provider: %w", err)
+		}
+	} else {
+		m = state.NewNetworkStateManager(rp, cfg.Smartnode.GetStateManagerContracts(), bc, &updateLog)
+	}
+	stateLocker := collectors.NewStateLocker()
+
+	// Initialize tasks
+	manageFeeRecipient, err := newManageFeeRecipient(c, log.NewColorLogger(ManageFeeRecipientColor))
+	if err != nil {
+		return err
+	}
+	defendChallengeExit, err := newDefendChallengeExit(c, log.NewColorLogger(DefendChallengeExitColor))
+	if err != nil {
+		return err
+	}
+
+	defendChallengePerformance, err := newDefendChallengePerformance(c, log.NewColorLogger(DefendChallengePerformanceColor))
+	if err != nil {
+		return err
+	}
+
+	distributeMinipools, err := newDistributeMinipools(c, log.NewColorLogger(DistributeMinipoolsColor))
+	if err != nil {
+		return err
+	}
+	setUseLatestDelegate, err := newSetUseLatestDelegate(c, log.NewColorLogger(SetUseLatestDelegateColor))
+	if err != nil {
+		return err
+	}
+	stakeMegapoolValidators, err := newStakeMegapoolValidator(c, log.NewColorLogger(StakeMegapoolValidatorColor))
+	if err != nil {
+		return err
+	}
+	notifyValidatorExit, err := newNotifyValidatorExit(c, log.NewColorLogger(NotifyValidatorExitColor))
+	if err != nil {
+		return err
+	}
+	notifyFinalBalance, err := newNotifyFinalBalance(c, log.NewColorLogger(NotifyFinalBalanceColor))
+	if err != nil {
+		return err
+	}
+	checkMinipoolExitRequests, err := newCheckMinipoolExitRequests(c, log.NewColorLogger(CheckMinipoolExitRequestsColor))
+	if err != nil {
+		return err
+	}
+	checkMegapoolExitRequests, err := newCheckMegapoolExitRequests(c, log.NewColorLogger(CheckMegapoolExitRequestsColor))
+	if err != nil {
+		return err
+	}
+	downloadRewardsTrees, err := newDownloadRewardsTrees(c, log.NewColorLogger(DownloadRewardsTreesColor))
+	if err != nil {
+		return err
+	}
+	defendPdaoProps, err := newDefendPdaoProps(c, log.NewColorLogger(DefendPdaoPropsColor))
+	if err != nil {
+		return err
+	}
+	provisionExpressTickets, err := newProvisionExpressTickets(c, log.NewColorLogger(ProvisionExpressTickets))
+	if err != nil {
+		return err
+	}
+	var verifyPdaoProps *verifyPdaoProps
+	// Make sure the user opted into this duty
+	verifyEnabled := cfg.Smartnode.VerifyProposals.Value.(bool)
+	if verifyEnabled {
+		verifyPdaoProps, err = newVerifyPdaoProps(c, log.NewColorLogger(VerifyPdaoPropsColor))
+		if err != nil {
+			return err
+		}
+	}
+
+	var prestakeMegapoolValidator *prestakeMegapoolValidator
+	prestakeMegapoolValidator, err = newPrestakeMegapoolValidator(c, log.NewColorLogger(PrestakeMegapoolValidatorColor))
+	if err != nil {
+		return err
+	}
+	var checkPorts *connectivity.CheckPortConnectivity
+	checkPorts, err = connectivity.NewCheckPortConnectivity(c, cfg, log.NewColorLogger(CheckPortConnectivityColor))
+	if err != nil {
+		return err
+	}
+
+	// Wait group to handle the various threads
+	wg := new(sync.WaitGroup)
+	wg.Add(2)
+
+	// Run task loop
+	go func() {
+		defer wg.Done()
+		// we assume clients are synced on startup so that we don't send unnecessary alerts
+		wasExecutionClientSynced := true
+		wasBeaconClientSynced := true
+		for {
+			// Exit if the process received SIGINT/SIGTERM
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			// Check the EC status
+			err := services.WaitEthClientSynced(c, false) // Force refresh the primary / fallback EC status
+			if err != nil {
+				wasExecutionClientSynced = false
+				errorLog.Printlnf("Execution client not synced: %s. Waiting for sync...", err.Error())
+				if !sleepWithContext(ctx, taskCooldown) {
+					return
+				}
+				continue
+			}
+
+			if !wasExecutionClientSynced {
+				updateLog.Println("Execution client is now synced.")
+				wasExecutionClientSynced = true
+				err := alerting.AlertExecutionClientSyncComplete(cfg)
+				if err != nil {
+					errorLog.Printlnf("error alerting execution client sync complete: %v", err)
+				}
+			}
+
+			// Check the BC status
+			err = services.WaitBeaconClientSynced(c, false) // Force refresh the primary / fallback BC status
+			if err != nil {
+				// NOTE: if not synced, it returns an error - so there isn't necessarily an underlying issue
+				wasBeaconClientSynced = false
+				errorLog.Printlnf("Beacon client not synced: %s. Waiting for sync...", err.Error())
+				if !sleepWithContext(ctx, taskCooldown) {
+					return
+				}
+				continue
+			}
+
+			if !wasBeaconClientSynced {
+				updateLog.Println("Beacon client is now synced.")
+				wasBeaconClientSynced = true
+				err := alerting.AlertBeaconClientSyncComplete(cfg)
+				if err != nil {
+					errorLog.Printlnf("error alerting beacon client sync complete: %v", err)
+				}
+			}
+
+			// Check if the protocol version has changed
+			newProtocolVersion, err := utils.GetCurrentVersion(rp, nil)
+			if err != nil {
+				errorLog.Println(err)
+				if !sleepWithContext(ctx, taskCooldown) {
+					return
+				}
+				continue
+			}
+			if newProtocolVersion.Compare(protocolVersion) != 0 {
+				updateLog.Printlnf("Protocol version changed to: %s\n", newProtocolVersion)
+				updateLog.Println("Exiting daemon to load the new contracts...")
+				os.Exit(0)
+			}
+
+			// Update the network state
+			state, err := updateNetworkState(m, &updateLog, nodeAccount.Address)
+			if err != nil {
+				errorLog.Println(err)
+				if !sleepWithContext(ctx, taskCooldown) {
+					return
+				}
+				continue
+			}
+			stateLocker.UpdateState(state)
+
+			// Keep the observe mode warning visible in the logs and the alert active for as long as observe mode is in effect
+			if isObserveMode {
+				observeLog.Println("Node daemon is observing address " + nodeAccount.Address.Hex() + ".")
+				observeLog.Println("Transactions will not be submitted. Fee recipient management targets your real node address.")
+				observeLog.Println("Run `rocketpool wallet end-masquerade` and restart the node/watchtower daemons when you have finished observing.")
+				if err := alerting.AlertObserveModeActive(cfg, nodeAccount.Address); err != nil {
+					errorLog.Println(err)
+				}
+			}
+
+			// Manage the fee recipient for the node
+			if err := manageFeeRecipient.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the defend challenge exit task
+			if err := defendChallengeExit.run(state); err != nil {
+				errorLog.Println(err)
+			}
+
+			// Run the defend challenge performance task
+			if err := defendChallengePerformance.run(state); err != nil {
+				errorLog.Println(err)
+			}
+
+			// Run the rewards download check
+			if err := downloadRewardsTrees.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the pDAO proposal defender
+			if err := defendPdaoProps.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the pDAO proposal verifier
+			if verifyPdaoProps != nil {
+				if err := verifyPdaoProps.run(state); err != nil {
+					errorLog.Println(err)
+				}
+				if !sleepWithContext(ctx, taskCooldown) {
+					return
+				}
+			}
+
+			// Run the megapool prestake check
+			if prestakeMegapoolValidator != nil {
+				if err := prestakeMegapoolValidator.run(state); err != nil {
+					errorLog.Println(err)
+				}
+				if !sleepWithContext(ctx, taskCooldown) {
+					return
+				}
+			}
+
+			// Run the megapool stake check
+			if err := stakeMegapoolValidators.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the megapool notify validator exit check
+			if err := notifyValidatorExit.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the megapool notify final balance check
+			if err := notifyFinalBalance.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the minipool exit request check
+			if err := checkMinipoolExitRequests.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the megapool exit request check
+			if err := checkMegapoolExitRequests.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the megapool provision express ticket check
+			if err := provisionExpressTickets.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the balance distribution check
+			if err := distributeMinipools.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the set use latest delegate check
+			if err := setUseLatestDelegate.run(state); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			// Run the port connectivity check
+			if err := checkPorts.Run(); err != nil {
+				errorLog.Println(err)
+			}
+			if !sleepWithContext(ctx, taskCooldown) {
+				return
+			}
+
+			if !sleepWithContext(ctx, tasksInterval) {
+				return
+			}
+		}
+	}()
+
+	// Run metrics loop
+	go func() {
+		defer wg.Done()
+		if err := runMetricsServer(ctx, c, log.NewColorLogger(MetricsColor), stateLocker); err != nil {
+			errorLog.Println(err)
+		}
+	}()
+
+	// Wait for both threads to stop
+	wg.Wait()
+	return nil
+}
+
+// sleepWithContext sleeps for d or until ctx is cancelled, returning false if cancelled.
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// Configure HTTP transport settings
+func configureHTTP() {
+	// The daemon makes a large number of concurrent RPC requests to the Eth1 client
+	// The HTTP transport is set to cache connections for future re-use equal to the maximum expected number of concurrent requests
+	// This prevents issues related to memory consumption and address allowance from repeatedly opening and closing connections
+	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = MaxConcurrentEth1Requests
+}
+
+// Copy the default fee recipient file into the proper location
+func deployDefaultFeeRecipientFile(c *cli.Command) error {
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return err
+	}
+
+	feeRecipientPath := cfg.Smartnode.GetGlobalFeeRecipientFilePath()
+	_, err = os.Stat(feeRecipientPath)
+	if os.IsNotExist(err) {
+		// Make sure the validators dir is created
+		validatorsFolder := filepath.Dir(feeRecipientPath)
+		err = os.MkdirAll(validatorsFolder, 0o755)
+		if err != nil {
+			return fmt.Errorf("could not create validators directory: %w", err)
+		}
+
+		// Create the file
+		var defaultFeeRecipientFileContents string
+		if cfg.IsNativeMode {
+			// Native mode needs an environment variable definition
+			defaultFeeRecipientFileContents = fmt.Sprintf("FEE_RECIPIENT=%s", cfg.Smartnode.GetRethAddress().Hex())
+		} else {
+			// Docker and Hybrid just need the address itself
+			defaultFeeRecipientFileContents = cfg.Smartnode.GetRethAddress().Hex()
+		}
+		err := os.WriteFile(feeRecipientPath, []byte(defaultFeeRecipientFileContents), 0o664)
+		if err != nil {
+			return fmt.Errorf("could not write default fee recipient file to %s: %w", feeRecipientPath, err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("Error checking fee recipient file status: %w", err)
+	}
+
+	return nil
+}
+
+// Remove the old fee recipient files that were created in v1.5.0
+func removeLegacyFeeRecipientFiles(c *cli.Command) error {
+	legacyFeeRecipientFile := "rp-fee-recipient.txt"
+
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return err
+	}
+
+	validatorsFolder := cfg.Smartnode.GetValidatorKeychainPath()
+
+	// Remove the legacy files
+	keystoreDirs := []string{lighthouse.KeystoreDir, nimbus.KeystoreDir, prysm.KeystoreDir, teku.KeystoreDir}
+	for _, keystoreDir := range keystoreDirs {
+		oldFile := filepath.Join(validatorsFolder, keystoreDir, legacyFeeRecipientFile)
+		_, err = os.Stat(oldFile)
+		if !os.IsNotExist(err) {
+			err = os.Remove(oldFile)
+			if err != nil {
+				fmt.Printf("NOTE: Couldn't remove old fee recipient file (%s): %s\nThis file is no longer used, you may remove it manually if you wish.\n", oldFile, err.Error())
+			}
+		}
+	}
+
+	return nil
+}
+
+// Update the latest network state at each cycle
+func updateNetworkState(m state.NetworkStateProvider, log *log.ColorLogger, nodeAddress common.Address) (*state.NetworkStateIndex, error) {
+	// Get the state of the network
+	state, err := m.GetHeadStateForNode(nodeAddress)
+	if err != nil {
+		return nil, fmt.Errorf("error updating network state: %w", err)
+	}
+	return state, nil
+}
+
+// Checks if the user-inputted priorityFee is greater than the oracle based maxFee
+// If so, return the min(priorityFee, 25% of the oracle based maxFee)
+func GetPriorityFee(priorityFee *big.Int, maxFee *big.Int) *big.Int {
+	// Check if priorityFee is less than maxFee
+	if priorityFee.Cmp(maxFee) < 0 {
+		return priorityFee
+	}
+
+	quarterMaxFee := new(big.Int).Div(maxFee, big.NewInt(4))
+
+	// Gets the min(priorityFee, 25% of the oracle based maxFee)
+	if priorityFee.Cmp(quarterMaxFee) < 0 {
+		return priorityFee
+	}
+	return quarterMaxFee
+}

@@ -1,0 +1,269 @@
+package network
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/rocket-pool/smartnode/bindings/deposit"
+	"github.com/rocket-pool/smartnode/bindings/minipool"
+	"github.com/rocket-pool/smartnode/bindings/network"
+	"github.com/rocket-pool/smartnode/bindings/node"
+	"github.com/rocket-pool/smartnode/bindings/tokens"
+	rpstate "github.com/rocket-pool/smartnode/bindings/utils/state"
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+
+	"github.com/rocket-pool/smartnode/shared/math"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func getStats(c *cli.Command) (*api.NetworkStatsResponse, error) {
+
+	// Get services
+	if err := services.RequireRocketStorage(c); err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.NetworkStatsResponse{}
+
+	// Sync
+	var wg errgroup.Group
+
+	// Get the deposit pool balance
+	wg.Go(func() error {
+		balance, err := deposit.GetBalance(rp, nil)
+		if err == nil {
+			response.DepositPoolBalance = math.WeiToEth(balance)
+		}
+		return err
+	})
+
+	// Get the total minipool capacity
+	wg.Go(func() error {
+		minipoolQueueCapacity, err := minipool.GetQueueCapacity(rp, nil)
+		if err == nil {
+			response.MinipoolCapacity = math.WeiToEth(minipoolQueueCapacity.Total)
+		}
+		return err
+	})
+
+	// Get the ETH utilization rate
+	wg.Go(func() error {
+		stakerUtilization, err := network.GetETHUtilizationRate(rp, nil)
+		if err == nil {
+			response.StakerUtilization = stakerUtilization
+		}
+		return err
+	})
+
+	// Get node fee
+	wg.Go(func() error {
+		nodeFee, err := network.GetNodeFee(rp, nil)
+		if err == nil {
+			response.NodeFee = nodeFee
+		}
+		return err
+	})
+
+	// Get node count
+	wg.Go(func() error {
+		nodeCount, err := node.GetNodeCount(rp, nil)
+		if err == nil {
+			response.NodeCount = nodeCount
+		}
+		return err
+	})
+
+	// Get minipool counts
+	wg.Go(func() error {
+		minipoolCounts, err := minipool.GetMinipoolCountPerStatus(rp, nil)
+		if err != nil {
+			return err
+		}
+		response.InitializedMinipoolCount = minipoolCounts.Initialized.Uint64()
+		response.PrelaunchMinipoolCount = minipoolCounts.Prelaunch.Uint64()
+		response.StakingMinipoolCount = minipoolCounts.Staking.Uint64()
+		response.WithdrawableMinipoolCount = minipoolCounts.Withdrawable.Uint64()
+		response.DissolvedMinipoolCount = minipoolCounts.Dissolved.Uint64()
+
+		finalizedCount, err := minipool.GetFinalisedMinipoolCount(rp, nil)
+		if err != nil {
+			return err
+		}
+		response.FinalizedMinipoolCount = finalizedCount
+
+		return nil
+	})
+
+	// Get RPL price
+	wg.Go(func() error {
+		rplPrice, err := network.GetRPLPrice(rp, nil)
+		if err == nil {
+			response.RplPrice = math.WeiToEth(rplPrice)
+		}
+		return err
+	})
+
+	// Get total RPL staked
+	wg.Go(func() error {
+		totalStaked, err := node.GetTotalStakedRPL(rp, nil)
+		if err == nil {
+			response.TotalRplStaked = math.WeiToEth(totalStaked)
+		}
+		return err
+	})
+
+	// Get RPL staked on megapools
+	wg.Go(func() error {
+		megapoolStaked, err := node.GetTotalMegapoolStakedRPL(rp, nil)
+		if err == nil {
+			response.TotalMegapoolRplStaked = math.WeiToEth(megapoolStaked)
+		}
+		return err
+	})
+
+	// Get legacy RPL staked
+	wg.Go(func() error {
+		legacyStaked, err := node.GetTotalLegacyStakedRPL(rp, nil)
+		if err == nil {
+			response.TotalLegacyRplStaked = math.WeiToEth(legacyStaked)
+		}
+		return err
+	})
+
+	// Get rETH price
+	wg.Go(func() error {
+		rethPrice, err := tokens.GetRETHExchangeRate(rp, nil)
+		if err == nil {
+			response.RethPrice = rethPrice
+		}
+		return err
+	})
+
+	// Get smoothing pool status
+	wg.Go(func() error {
+		smoothingPoolNodes, err := node.GetSmoothingPoolRegisteredNodeCount(rp, nil)
+		if err == nil {
+			response.SmoothingPoolNodes = smoothingPoolNodes
+		}
+		return err
+	})
+
+	// Get smoothing pool balance
+	wg.Go(func() error {
+		// Get the Smoothing Pool contract's balance
+		smoothingPoolContract, err := rp.GetContract("rocketSmoothingPool", nil)
+		if err != nil {
+			return fmt.Errorf("error getting smoothing pool contract: %w", err)
+		}
+		response.SmoothingPoolAddress = *smoothingPoolContract.Address
+
+		smoothingPoolBalance, err := rp.Client.BalanceAt(context.Background(), *smoothingPoolContract.Address, nil)
+		if err != nil {
+			return fmt.Errorf("error getting smoothing pool balance: %w", err)
+		}
+
+		response.SmoothingPoolBalance = math.WeiToEth(smoothingPoolBalance)
+		return nil
+	})
+
+	wg.Go(func() error {
+
+		megapoolAddressSet := make(map[common.Address]bool)
+
+		// Fetch the global megapool validator index
+		cfg, err := services.GetConfig(c)
+		if err != nil {
+			return fmt.Errorf("error getting config: %w", err)
+		}
+		multicallerAddress := common.HexToAddress(cfg.Smartnode.GetMulticallAddress())
+		balanceBatcherAddress := common.HexToAddress(cfg.Smartnode.GetBalanceBatcherAddress())
+		contracts, err := rpstate.NewNetworkContracts(rp, multicallerAddress, balanceBatcherAddress, nil)
+		if err != nil {
+			return fmt.Errorf("error creating network contracts: %w", err)
+		}
+		megapoolValidators, err := rpstate.GetAllMegapoolValidators(rp, contracts)
+		if err != nil {
+			return fmt.Errorf("error getting all megapool validator details: %w", err)
+		}
+		megapoolStakedCount := 0
+		megapoolPrestakeCount := 0
+		megapoolInQueueCount := 0
+		megapoolExitedCount := 0
+		megapoolLockedCount := 0
+		megapoolExitingCount := 0
+		megapoolDissolvedCount := 0
+		megapoolValidatorCount := 0
+		megapoolContractCount := 0
+		for _, validator := range megapoolValidators {
+			// Count the number of unique megapool addresses
+			megapoolAddressSet[validator.MegapoolAddress] = true
+			if validator.ValidatorInfo.Staked {
+				megapoolStakedCount++
+			}
+			if validator.ValidatorInfo.InPrestake {
+				megapoolPrestakeCount++
+			}
+			if validator.ValidatorInfo.InQueue {
+				megapoolInQueueCount++
+			}
+			if validator.ValidatorInfo.Exited {
+				megapoolExitedCount++
+			}
+			if validator.ValidatorInfo.Locked {
+				megapoolLockedCount++
+			}
+			if validator.ValidatorInfo.Exiting {
+				megapoolExitingCount++
+			}
+			if validator.ValidatorInfo.Dissolved {
+				megapoolDissolvedCount++
+			}
+		}
+		megapoolContractCount = len(megapoolAddressSet)
+		megapoolValidatorCount = megapoolStakedCount + megapoolPrestakeCount + megapoolInQueueCount + megapoolExitedCount + megapoolLockedCount + megapoolExitingCount + megapoolDissolvedCount
+		response.MegapoolContractCount = uint64(megapoolContractCount)
+		response.MegapoolValidatorCount = uint64(megapoolValidatorCount)
+		response.MegapoolValidatorStakingCount = uint64(megapoolStakedCount)
+		response.MegapoolValidatorInPrestakeCount = uint64(megapoolPrestakeCount)
+		response.MegapoolValidatorInQueueCount = uint64(megapoolInQueueCount)
+		response.MegapoolValidatorExitedCount = uint64(megapoolExitedCount)
+		response.MegapoolValidatorLockedCount = uint64(megapoolLockedCount)
+		response.MegapoolValidatorExitingCount = uint64(megapoolExitingCount)
+		response.MegapoolValidatorDissolvedCount = uint64(megapoolDissolvedCount)
+		return nil
+	})
+
+	// Wait for data
+	if err := wg.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Get the TVL
+	activeMinipools := response.InitializedMinipoolCount +
+		response.PrelaunchMinipoolCount +
+		response.StakingMinipoolCount +
+		response.WithdrawableMinipoolCount +
+		response.DissolvedMinipoolCount
+	tvl := float64(activeMinipools)*32 + response.DepositPoolBalance + response.MinipoolCapacity + (response.TotalRplStaked * response.RplPrice)
+	response.TotalValueLocked = tvl
+
+	// Return response
+	return &response, nil
+
+}
+
+func statsHandler(ctx snroute.Context) {
+	resp, err := getStats(ctx.Command())
+	response.WriteResponse(ctx.Writer, resp, err)
+}

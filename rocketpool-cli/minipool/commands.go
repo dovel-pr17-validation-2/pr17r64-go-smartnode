@@ -1,0 +1,409 @@
+package minipool
+
+import (
+	"context"
+
+	"github.com/urfave/cli/v3"
+
+	cliutils "github.com/rocket-pool/smartnode/rocketpool-cli/cli"
+)
+
+// Register commands
+func RegisterCommands(app *cli.Command, name string, aliases []string) {
+	app.Commands = append(app.Commands, &cli.Command{
+		Name:    name,
+		Aliases: aliases,
+		Usage:   "Manage the node's minipools",
+		Commands: []*cli.Command{
+
+			{
+				Name:      "status",
+				Aliases:   []string{"s"},
+				Usage:     "Get a list of the node's minipools",
+				UsageText: "rocketpool minipool status",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name:    "include-finalized",
+						Aliases: []string{"f"},
+						Usage:   "Include finalized minipools in the list (default is to hide them).",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+
+					// Validate args
+					if err := cliutils.ValidateArgCount(c, 0); err != nil {
+						return err
+					}
+
+					// Run
+					return getStatus(c.Bool("include-finalized"))
+
+				},
+			},
+
+			{
+				Name:      "stake",
+				Aliases:   []string{"t"},
+				Usage:     "Stake a minipool after the scrub check, moving it from prelaunch to staking.",
+				UsageText: "rocketpool minipool stake [options]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "minipool",
+						Aliases: []string{"m"},
+						Usage:   "The minipool/s to stake (address or 'all')",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+
+					// Validate args
+					if err := cliutils.ValidateArgCount(c, 0); err != nil {
+						return err
+					}
+
+					// Validate flags
+					if c.String("minipool") != "" && c.String("minipool") != "all" {
+						if _, err := cliutils.ValidateAddress("minipool address", c.String("minipool")); err != nil {
+							return err
+						}
+					}
+
+					// Run
+					return stakeMinipools(c.String("minipool"), c.Bool("yes"))
+
+				},
+			},
+
+			{
+				Name:      "set-withdrawal-creds",
+				Aliases:   []string{"swc"},
+				Usage:     "Convert the withdrawal credentials for a migrated solo validator from the old 0x00 value to the minipool address. Required to complete the migration process.",
+				UsageText: "rocketpool minipool set-withdrawal-creds minipool-address [options]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "mnemonic",
+						Aliases: []string{"m"},
+						Usage:   "Use this flag to provide the mnemonic for your validator key instead of typing it interactively.",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+
+					// Validate args
+					if err := cliutils.ValidateArgCount(c, 1); err != nil {
+						return err
+					}
+					address, err := cliutils.ValidateAddress("minipool-address", c.Args().Get(0))
+					if err != nil {
+						return err
+					}
+
+					// Run
+					return setWithdrawalCreds(c.String("mnemonic"), address)
+
+				},
+			},
+			{
+				Name:      "import-key",
+				Aliases:   []string{"ik"},
+				Usage:     "Import the externally-derived key for a minipool that was previously a solo validator, so the Smart Node's VC manages it instead of your externally-managed VC.",
+				UsageText: "rocketpool minipool import-key minipool-address [options]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "mnemonic",
+						Aliases: []string{"m"},
+						Usage:   "Use this flag to provide the mnemonic for your validator key instead of typing it interactively.",
+					},
+					&cli.BoolFlag{
+						Name:    "no-restart",
+						Aliases: []string{"n"},
+						Usage:   "Don't restart the Validator Client after importing the key. Note that the key won't be loaded (and won't attest) until you restart the VC to load it.",
+					},
+					&cli.BoolFlag{
+						Name:    "yes",
+						Aliases: []string{"y"},
+						Usage:   "Automatically confirm all interactive questions",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+
+					// Validate args
+					if err := cliutils.ValidateArgCount(c, 1); err != nil {
+						return err
+					}
+					address, err := cliutils.ValidateAddress("minipool-address", c.Args().Get(0))
+					if err != nil {
+						return err
+					}
+
+					// Run
+					return importKey(c.String("mnemonic"), c.Bool("no-restart"), c.Bool("yes"), address)
+
+				},
+			},
+
+			{
+				Name:      "refund",
+				Aliases:   []string{"r"},
+				Usage:     "Refund ETH belonging to the node from minipools",
+				UsageText: "rocketpool minipool refund [options]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "minipool",
+						Aliases: []string{"m"},
+						Usage:   "The minipool/s to refund from (address or 'all')",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+
+					// Validate args
+					if err := cliutils.ValidateArgCount(c, 0); err != nil {
+						return err
+					}
+
+					// Validate flags
+					if c.String("minipool") != "" && c.String("minipool") != "all" {
+						if _, err := cliutils.ValidateAddress("minipool address", c.String("minipool")); err != nil {
+							return err
+						}
+					}
+
+					// Run
+					return refundMinipools(c.String("minipool"), c.Bool("yes"))
+
+				},
+			},
+
+			{
+				Name:      "distribute-balance",
+				Aliases:   []string{"d"},
+				Usage:     "Distribute a minipool's ETH balance between your withdrawal address and the rETH holders.",
+				UsageText: "rocketpool minipool distribute-balance [options]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "minipool",
+						Aliases: []string{"m"},
+						Usage:   "The minipool/s to distribute the balance of (address or 'all')",
+					},
+					&cli.Float64Flag{
+						Name:    "threshold",
+						Aliases: []string{"t"},
+						Usage:   "Filter on a minimum amount of ETH that can be distributed - minipools below this amount won't be shown",
+					},
+					&cli.BoolFlag{
+						Name:    "yes",
+						Aliases: []string{"y"},
+						Usage:   "Automatically confirm distributing balance on minipool/s",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+
+					// Validate args
+					if err := cliutils.ValidateArgCount(c, 0); err != nil {
+						return err
+					}
+
+					// Validate flags
+					if c.String("minipool") != "" && c.String("minipool") != "all" {
+						if _, err := cliutils.ValidateAddress("minipool address", c.String("minipool")); err != nil {
+							return err
+						}
+					}
+
+					// Run
+					return distributeBalance(c.String("minipool"), c.Float64("threshold"), c.Bool("yes"))
+
+				},
+			},
+			{
+				Name:      "exit",
+				Aliases:   []string{"e"},
+				Usage:     "Exit staking minipools from the beacon chain",
+				UsageText: "rocketpool minipool exit [options]",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name:    "yes",
+						Aliases: []string{"y"},
+						Usage:   "Automatically confirm exiting minipool/s",
+					},
+					&cli.StringFlag{
+						Name:    "minipool",
+						Aliases: []string{"m"},
+						Usage:   "The minipool/s to exit (address or 'all')",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+
+					// Validate args
+					if err := cliutils.ValidateArgCount(c, 0); err != nil {
+						return err
+					}
+
+					// Validate flags
+					if c.String("minipool") != "" && c.String("minipool") != "all" {
+						if _, err := cliutils.ValidateAddress("minipool address", c.String("minipool")); err != nil {
+							return err
+						}
+					}
+
+					// Run
+					return exitMinipools(c.String("minipool"), c.Bool("yes"))
+
+				},
+			},
+
+			{
+				Name:      "close",
+				Aliases:   []string{"c"},
+				Usage:     "Withdraw any remaining balance from a minipool and close it",
+				UsageText: "rocketpool minipool close [options]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "minipool",
+						Aliases: []string{"m"},
+						Usage:   "The minipool/s to close (address or 'all')",
+					},
+					&cli.BoolFlag{
+						Name:  "confirm-slashing",
+						Usage: "Reserved for acknowledging situations where you've been slashed by the Beacon Chain, and closing a minipool will result in the complete loss of the ETH bond and your RPL collateral. DO NOT use this flag unless you have been explicitly instructed to do so.",
+					},
+					&cli.BoolFlag{
+						Name:    "bundle",
+						Aliases: []string{"b"},
+						Usage:   "Force closing via a Flashbots bundle (distribute + finalise). Without this flag, a bundle is still used automatically if your fee distributor has a balance. Mainnet only.",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+
+					// Validate args
+					if err := cliutils.ValidateArgCount(c, 0); err != nil {
+						return err
+					}
+
+					// Validate flags
+					if c.String("minipool") != "" && c.String("minipool") != "all" {
+						if _, err := cliutils.ValidateAddress("minipool address", c.String("minipool")); err != nil {
+							return err
+						}
+					}
+
+					// Run
+					return closeMinipools(c.String("minipool"), c.Bool("confirm-slashing"), c.Bool("yes"), c.Bool("bundle"))
+
+				},
+			},
+
+			{
+				Name:      "delegate-upgrade",
+				Aliases:   []string{"u"},
+				Usage:     "Upgrade a minipool's delegate contract to the latest version",
+				UsageText: "rocketpool minipool delegate-upgrade [options]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "minipool, m",
+						Usage: "The minipool/s to upgrade (address or 'all')",
+					},
+					&cli.BoolFlag{
+						Name:  "include-finalized, f",
+						Usage: "Include finailized minipools in the list (default is to hide them).",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+
+					// Validate args
+					if err := cliutils.ValidateArgCount(c, 0); err != nil {
+						return err
+					}
+
+					// Validate flags
+					if c.String("minipool") != "" && c.String("minipool") != "all" {
+						if _, err := cliutils.ValidateAddress("minipool address", c.String("minipool")); err != nil {
+							return err
+						}
+					}
+
+					// Run
+					return delegateUpgradeMinipools(c.String("minipool"), c.Bool("include-finalized"), c.Bool("yes"))
+
+				},
+			},
+
+			{
+				Name:        "verify-performance",
+				Aliases:     []string{"vp"},
+				Usage:       "Verify the RPIP-73 target-vote attestation performance of one or more minipools over a range of epochs.",
+				UsageText:   "rocketpool minipool verify-performance minipools [options]",
+				Description: "minipools is either a single minipool address, a comma-separated list of minipool addresses, or 'all' to check every minipool owned by the node. Eligible results are offered as challenges, grouped into lists of at most 32 minipools with the same owner and missed epochs.",
+				Flags: []cli.Flag{
+					&cli.Uint64Flag{
+						Name:    "start-epoch",
+						Aliases: []string{"s"},
+						Usage:   "The first epoch in the inclusive performance period.",
+					},
+					&cli.Uint64Flag{
+						Name:    "epochs",
+						Aliases: []string{"e"},
+						Usage:   "Number of epochs to inspect starting at --start-epoch. Defaults to the pDAO performance_period setting.",
+					},
+					&cli.BoolFlag{
+						Name:    "yes",
+						Aliases: []string{"y"},
+						Usage:   "Automatically confirm verification prompts and eligible challenge transactions that lock staked RPL.",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					if err := cliutils.ValidateArgCount(c, 1); err != nil {
+						return err
+					}
+					targets := c.Args().Get(0)
+					if err := validateMinipoolTargets(targets); err != nil {
+						return err
+					}
+					return verifyMinipoolPerformance(
+						targets,
+						c.Uint64("start-epoch"),
+						c.Uint64("epochs"),
+						c.Bool("yes"),
+					)
+				},
+			},
+
+			{
+				Name:      "rescue-dissolved",
+				Aliases:   []string{"rd"},
+				Usage:     "Manually deposit ETH into the Beacon deposit contract for a dissolved minipool, activating it on the Beacon Chain so it can be exited.",
+				UsageText: "rocketpool minipool rescue-dissolved [options]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "minipool, m",
+						Usage: "The minipool/s to rescue (address, starting with 0x)",
+					},
+					&cli.StringFlag{
+						Name:  "amount, a",
+						Usage: "The amount of ETH to deposit into the minipool",
+					},
+					&cli.BoolFlag{
+						Name:  "no-send, n",
+						Usage: "Don't submit the transaction",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+
+					// Validate args
+					if err := cliutils.ValidateArgCount(c, 0); err != nil {
+						return err
+					}
+
+					// Validate flags
+					if c.String("minipool") != "" {
+						if _, err := cliutils.ValidateAddress("minipool address", c.String("minipool")); err != nil {
+							return err
+						}
+					}
+
+					// Run
+					return rescueDissolved(c.String("minipool"), c.String("amount"), c.Bool("no-send"), c.Bool("yes"))
+
+				},
+			},
+		},
+	})
+}

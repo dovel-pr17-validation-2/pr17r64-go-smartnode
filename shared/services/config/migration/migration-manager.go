@@ -1,0 +1,152 @@
+package migration
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/go-version"
+)
+
+type ConfigUpgrader struct {
+	Version     *version.Version
+	UpgradeFunc func(serializedConfig map[string]map[string]string) error
+}
+
+func UpdateConfig(serializedConfig map[string]map[string]string) error {
+
+	// Get the config's version
+	configVersion, err := getVersionFromConfig(serializedConfig)
+	if err != nil {
+		return err
+	}
+
+	// Create versions
+	v131, err := parseVersion("1.3.1")
+	if err != nil {
+		return err
+	}
+	v151, err := parseVersion("1.5.1")
+	if err != nil {
+		return err
+	}
+	v198, err := parseVersion("1.9.8")
+	if err != nil {
+		return err
+	}
+	v1153, err := parseVersion("1.15.3")
+	if err != nil {
+		return err
+	}
+	v1160, err := parseVersion("1.16.0")
+	if err != nil {
+		return err
+	}
+	v1189, err := parseVersion("1.18.9")
+	if err != nil {
+		return err
+	}
+	v1205, err := parseVersion("1.20.5")
+	if err != nil {
+		return err
+	}
+	v1210, err := parseVersion("1.21.0")
+	if err != nil {
+		return err
+	}
+	v1244, err := parseVersion("1.24.4")
+	if err != nil {
+		return err
+	}
+
+	// Create the collection of upgraders
+	upgraders := []ConfigUpgrader{
+		{
+			Version:     v131,
+			UpgradeFunc: upgradeFromV131,
+		}, {
+			Version:     v151,
+			UpgradeFunc: upgradeFromV151,
+		}, {
+			Version:     v198,
+			UpgradeFunc: upgradeFromV198,
+		}, {
+			Version:     v1153,
+			UpgradeFunc: upgradeFromV1153,
+		},
+		{
+			Version:     v1160,
+			UpgradeFunc: upgradeFromV1160,
+		},
+		{
+			Version:     v1189,
+			UpgradeFunc: upgradeFromV1189,
+		},
+		{
+			Version:     v1205,
+			UpgradeFunc: upgradeFromV1205,
+		},
+		{
+			Version:     v1210,
+			UpgradeFunc: upgradeFromV1210,
+		},
+		{
+			Version:     v1244,
+			UpgradeFunc: upgradeFromV1244,
+		},
+	}
+
+	// Find the index of the provided config's version
+	targetIndex := -1
+	for i, upgrader := range upgraders {
+		if configVersion.LessThanOrEqual(upgrader.Version) {
+			targetIndex = i
+			break
+		}
+	}
+
+	// If there are no upgrades to apply, return
+	if targetIndex == -1 {
+		return nil
+	}
+
+	// If there are upgrades, start at the first applicable index and apply them all in series
+	for i := targetIndex; i < len(upgraders); i++ {
+		upgrader := upgraders[i]
+		err = upgrader.UpgradeFunc(serializedConfig)
+		if err != nil {
+			return fmt.Errorf("error applying upgrade for config version %s: %w", upgrader.Version.String(), err)
+		}
+	}
+
+	return nil
+
+}
+
+// Get the Smart Node version that the given config was built with
+func getVersionFromConfig(serializedConfig map[string]map[string]string) (*version.Version, error) {
+	rootConfig, exists := serializedConfig["root"]
+	if !exists {
+		return nil, fmt.Errorf("expected a section called `root` but it didn't exist")
+	}
+
+	configVersionString, exists := rootConfig["version"]
+	if !exists {
+		return nil, fmt.Errorf("expected a `root` setting named `version` but it didn't exist")
+	}
+
+	configVersion, err := version.NewVersion(strings.TrimPrefix(configVersionString, "v"))
+	if err != nil {
+		return nil, fmt.Errorf("error parsing version [%s] from config file: %w", configVersionString, err)
+	}
+
+	return configVersion, nil
+}
+
+// Parses a version string into a semantic version
+func parseVersion(versionString string) (*version.Version, error) {
+	parsedVersion, err := version.NewSemver(versionString)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing version %s: %w", versionString, err)
+	}
+	return parsedVersion, nil
+}

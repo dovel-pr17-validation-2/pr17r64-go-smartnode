@@ -1,0 +1,74 @@
+package config
+
+import (
+	"github.com/rocket-pool/smartnode/shared/services/config"
+	cfgtypes "github.com/rocket-pool/smartnode/shared/types/config"
+)
+
+// The page wrapper for the Smart Node config
+type SmartnodeConfigPage struct {
+	home   *settingsHome
+	page   *page
+	layout *standardLayout
+}
+
+// Creates a new page for the Smart Node settings
+func NewSmartnodeConfigPage(home *settingsHome) *SmartnodeConfigPage {
+
+	configPage := &SmartnodeConfigPage{
+		home: home,
+	}
+
+	configPage.createContent()
+	configPage.page = newPage(
+		home.homePage,
+		"settings-smartnode",
+		"Smart Node and TX Fees",
+		"Select this to configure the settings for the Smart Node itself, including the defaults and limits on transaction fees.",
+		configPage.layout.grid,
+	)
+
+	return configPage
+
+}
+
+// Get the underlying page
+func (configPage *SmartnodeConfigPage) getPage() *page {
+	return configPage.page
+}
+
+// Creates the content for the Smart Node settings page
+func (configPage *SmartnodeConfigPage) createContent() {
+
+	// Create the layout
+	masterConfig := configPage.home.md.Config
+	layout := newStandardLayout()
+	configPage.layout = layout
+	layout.createForm(&masterConfig.Smartnode.Network, "Smart Node and TX Fee Settings")
+
+	// Return to the home page after pressing Escape
+	layout.form.SetInputCapture(layout.getInputCapture(configPage.home.md, configPage.home.homePage))
+
+	// Set up the form items
+	params := append(masterConfig.Smartnode.GetParameters(), &masterConfig.EnableIPv6, &masterConfig.Alertmanager.ShowAlertsOnCLI)
+	formItems := createParameterizedFormItems(params, layout)
+	for _, formItem := range formItems {
+		layout.form.AddFormItem(formItem.item)
+		layout.parameters[formItem.item] = formItem
+		if formItem.parameter.ID == config.NetworkID {
+			dropDown := formItem.item.(*DropDown)
+			dropDown.SetSelectedFunc(func(text string, index int) {
+				newNetwork := configPage.home.md.Config.Smartnode.Network.Options[index].Value.(cfgtypes.Network)
+				configPage.home.md.Config.ChangeNetwork(newNetwork)
+				configPage.home.refresh()
+			})
+		}
+	}
+	layout.refresh()
+
+}
+
+// Handle a bulk redraw request
+func (configPage *SmartnodeConfigPage) handleLayoutChanged() {
+	configPage.layout.refresh()
+}

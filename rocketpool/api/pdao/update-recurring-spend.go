@@ -1,0 +1,150 @@
+package pdao
+
+import (
+	"math/big"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/urfave/cli/v3"
+
+	"github.com/rocket-pool/smartnode/bindings/dao/protocol"
+	"github.com/rocket-pool/smartnode/bindings/node"
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func canProposeRecurringSpendUpdate(c *cli.Command, contractName string, recipient common.Address, amountPerPeriod *big.Int, periodLength time.Duration, numberOfPeriods uint64, customMessage string) (*api.PDAOCanProposeRecurringSpendResponse, error) {
+	// Get services
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	bc, err := services.GetBeaconClient(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.PDAOCanProposeRecurringSpendResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Sync
+	var isRplLockingAllowed bool
+
+	// Get is RPL locking allowed
+	isRplLockingAllowed, err = node.GetRPLLockedAllowed(rp, nodeAccount.Address, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update & return response
+	response.IsRplLockingDisallowed = !isRplLockingAllowed
+
+	// return if proposing is not possible
+	response.CanPropose = !response.IsRplLockingDisallowed
+	if !response.CanPropose {
+		return &response, nil
+	}
+
+	// Get the account transactor
+	opts, err := w.GetNodeAccountTransactor()
+	if err != nil {
+		return nil, err
+	}
+
+	// Try proposing
+	blockNumber, pollard, err := createPollard(rp, cfg, bc)
+	if err != nil {
+		return nil, err
+	}
+	gasLimits, err := protocol.EstimateProposeRecurringTreasurySpendUpdateGas(rp, customMessage, contractName, recipient, amountPerPeriod, periodLength, numberOfPeriods, blockNumber, pollard, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update & return response
+	response.BlockNumber = blockNumber
+	response.GasLimits = gasLimits
+	return &response, nil
+}
+
+func proposeRecurringSpendUpdate(c *cli.Command, contractName string, recipient common.Address, amountPerPeriod *big.Int, periodLength time.Duration, numberOfPeriods uint64, blockNumber uint32, customMessage string, t *snroute.TransactOpts) (*api.PDAOProposeOneTimeSpendResponse, error) {
+	opts := t.Opts()
+
+	// Get services
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	bc, err := services.GetBeaconClient(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.PDAOProposeOneTimeSpendResponse{}
+
+	// Propose
+	pollard, err := getPollard(rp, cfg, bc, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+	proposalID, hash, err := protocol.ProposeRecurringTreasurySpendUpdate(rp, customMessage, contractName, recipient, amountPerPeriod, periodLength, numberOfPeriods, blockNumber, pollard, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update & return response
+	response.ProposalId = proposalID
+	response.TxHash = hash
+	return &response, nil
+}
+
+func canProposeRecurringSpendUpdateHandler(ctx snroute.Context) {
+	contractName, recipient, amountPerPeriod, periodLength, _, numberOfPeriods, customMessage, err := parseRecurringSpendParams(ctx.Request, true)
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := canProposeRecurringSpendUpdate(ctx.Command(), contractName, recipient, amountPerPeriod, periodLength, numberOfPeriods, customMessage)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func proposeRecurringSpendUpdateHandler(ctx snroute.WriteContext) {
+	contractName, recipient, amountPerPeriod, periodLength, _, numberOfPeriods, customMessage, err := parseRecurringSpendParams(ctx.Request, true)
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	blockNumber, err := parseUint32Param(ctx.Request, "blockNumber")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := proposeRecurringSpendUpdate(ctx.Command(), contractName, recipient, amountPerPeriod, periodLength, numberOfPeriods, blockNumber, customMessage, opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}

@@ -1,0 +1,114 @@
+package node
+
+import (
+	"fmt"
+	"strings"
+
+	cliutils "github.com/rocket-pool/smartnode/rocketpool-cli/cli"
+	"github.com/rocket-pool/smartnode/rocketpool-cli/cli/color"
+	"github.com/rocket-pool/smartnode/shared/services/rocketpool"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func printClientStatus(status *api.ClientStatus, name string) {
+
+	if status.Error != "" {
+		fmt.Printf("Your %s is unavailable (%s).\n", name, status.Error)
+		return
+	}
+
+	if status.IsSynced {
+		fmt.Printf("Your %s is fully synced.\n", name)
+		return
+	}
+
+	fmt.Printf("Your %s is still syncing (%0.2f%%).\n", name, rocketpool.SyncRatioToPercent(status.SyncProgress))
+	if strings.Contains(name, "execution") && status.SyncProgress == 0 {
+		fmt.Printf("\tNOTE: your %s may not report sync progress.\n\tYou should check its logs to review it.\n", name)
+	}
+}
+
+func printSyncProgress(status *api.ClientManagerStatus, name string) {
+
+	// Print primary client status
+	printClientStatus(&status.PrimaryClientStatus, fmt.Sprintf("primary %s client", name))
+
+	if !status.FallbackEnabled {
+		fmt.Printf("You do not have a fallback %s client enabled.\n", name)
+		return
+	}
+
+	// A fallback is enabled, so print fallback client status
+	printClientStatus(&status.FallbackClientStatus, fmt.Sprintf("fallback %s client", name))
+}
+
+func getSyncProgress() error {
+
+	// Get RP client
+	rp := rocketpool.NewClient()
+	defer rp.Close()
+
+	// Get the config
+	cfg, isNew, err := rp.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("Error loading configuration: %w", err)
+	}
+
+	// Print what network we're on
+	err = cliutils.PrintNetwork(cfg.GetNetworkInfo(), isNew)
+	if err != nil {
+		return err
+	}
+
+	// Report progress before checking contracts. The deposit-contract endpoint
+	// requires a synced EC and can wait behind the daemon's background sync loop.
+	status, err := rp.NodeSync()
+	if err != nil {
+		return err
+	}
+	printSyncProgress(&status.EcStatus, "execution")
+	printSyncProgress(&status.BcStatus, "consensus")
+	fmt.Println()
+
+	if cfg.HasRocketPoolContracts() {
+		if !hasSyncedExecutionClient(&status.EcStatus) {
+			color.YellowPrintln("The deposit contract network check is unavailable until an execution client is synced and ready.")
+			return nil
+		}
+		// Make sure ETH2 is on the correct chain using Rocket Pool's deposit contract.
+		depositContractInfo, err := rp.DepositContractInfo()
+		if err != nil {
+			return err
+		}
+		if !depositContractInfo.SufficientSync {
+			color.YellowPrintln("Your execution client hasn't synced enough to determine if your execution and consensus clients are on the same network.")
+			color.YellowPrintln("To run this safety check, try again later when the execution client has made more sync progress.")
+			fmt.Println()
+			return nil
+		}
+		if depositContractInfo.RPNetwork != depositContractInfo.BeaconNetwork ||
+			depositContractInfo.RPDepositContract != depositContractInfo.BeaconDepositContract {
+			cliutils.PrintDepositMismatchError(
+				depositContractInfo.RPNetwork,
+				depositContractInfo.BeaconNetwork,
+				depositContractInfo.RPDepositContract,
+				depositContractInfo.BeaconDepositContract)
+			return nil
+		}
+		fmt.Println("Your consensus client is on the correct network.")
+	} else {
+		fmt.Println("Rocket Pool contracts are not configured; skipping the deposit contract network check.")
+	}
+	fmt.Println()
+
+	// Return
+	return nil
+
+}
+
+func hasSyncedExecutionClient(status *api.ClientManagerStatus) bool {
+	ready := func(client api.ClientStatus) bool {
+		return client.IsWorking && client.IsSynced && client.Error == ""
+	}
+	return ready(status.PrimaryClientStatus) || (status.FallbackEnabled && ready(status.FallbackClientStatus))
+}

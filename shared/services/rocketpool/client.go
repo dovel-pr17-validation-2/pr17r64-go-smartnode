@@ -1,0 +1,1656 @@
+package rocketpool
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"math/big"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fatih/color"
+	"github.com/goccy/go-json"
+
+	"github.com/alessio/shellescape"
+	"github.com/blang/semver/v4"
+	"github.com/mitchellh/go-homedir"
+
+	"github.com/rocket-pool/smartnode/addons/graffiti_wall_writer"
+	clicolor "github.com/rocket-pool/smartnode/rocketpool-cli/cli/color"
+	"github.com/rocket-pool/smartnode/shared/services/config"
+	"github.com/rocket-pool/smartnode/shared/services/rocketpool/assets"
+	"github.com/rocket-pool/smartnode/shared/services/rocketpool/template"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+	cfgtypes "github.com/rocket-pool/smartnode/shared/types/config"
+)
+
+// Config
+const (
+	SettingsFile             string = "user-settings.yml"
+	BackupSettingsFile       string = "user-settings-backup.yml"
+	PrometheusConfigTemplate string = "prometheus.tmpl"
+	PrometheusFile           string = "prometheus.yml"
+
+	templatesDir    string = "templates"
+	overrideDir     string = "override"
+	runtimeDir      string = "runtime"
+	upgradeFlagFile string = ".firstrun"
+
+	nethermindAdminUrl          string = "http://127.0.0.1:7434"
+	pruneStarterContainerSuffix string = "_nm_prune_starter"
+
+	DebugColor = color.FgYellow
+)
+
+var Defaults Globals
+
+// When printing sync percents, we should avoid printing 100%.
+// This function is only called if we're still syncing,
+// and the `%0.2f` token will round up if we're above 99.99%.
+func SyncRatioToPercent(in float64) float64 {
+	return math.Min(99.99, in*100)
+}
+
+type Globals struct {
+	ConfigPath  string
+	DaemonPath  string
+	MaxFee      float64
+	MaxPrioFee  float64
+	GasLimit    uint64
+	DebugPrint  bool
+	CustomNonce *big.Int
+}
+
+// Rocket Pool client
+type Client struct {
+	globals Globals
+
+	// apiURL is the base URL for the node's HTTP API server.
+	// It is derived lazily from config on first use.
+	apiURL       string
+	apiToken     string
+	apiTokenPath string
+	apiAuthErr   error
+	apiURLOnce   sync.Once
+}
+
+func getClientStatusString(clientStatus api.ClientStatus) string {
+	if clientStatus.IsSynced {
+		return "synced and ready"
+	}
+
+	if clientStatus.IsWorking {
+		return fmt.Sprintf("syncing (%.2f%%)", SyncRatioToPercent(clientStatus.SyncProgress))
+	}
+
+	return fmt.Sprintf("unavailable (%s)", clientStatus.Error)
+}
+
+// Check the status of the Execution and Consensus client(s) and provision the API with them
+func checkClientStatus(rp *Client) (bool, error) {
+
+	// Check if the primary clients are up, synced, and able to respond to requests - if not, forces the use of the fallbacks for this command
+	response, err := rp.GetClientStatus()
+	if err != nil {
+		return false, err
+	}
+
+	ecMgrStatus := response.EcManagerStatus
+	bcMgrStatus := response.BcManagerStatus
+
+	// Primary EC and CC are good
+	if ecMgrStatus.PrimaryClientStatus.IsSynced && bcMgrStatus.PrimaryClientStatus.IsSynced {
+		return true, nil
+	}
+
+	// Get the status messages
+	primaryEcStatus := getClientStatusString(ecMgrStatus.PrimaryClientStatus)
+	primaryBcStatus := getClientStatusString(bcMgrStatus.PrimaryClientStatus)
+	fallbackEcStatus := getClientStatusString(ecMgrStatus.FallbackClientStatus)
+	fallbackBcStatus := getClientStatusString(bcMgrStatus.FallbackClientStatus)
+
+	// Check the fallbacks if enabled
+	if ecMgrStatus.FallbackEnabled && bcMgrStatus.FallbackEnabled {
+
+		// Fallback EC and CC are good
+		if ecMgrStatus.FallbackClientStatus.IsSynced && bcMgrStatus.FallbackClientStatus.IsSynced {
+			clicolor.YellowPrintln("NOTE: primary clients are not ready, using fallback clients...")
+			clicolor.YellowPrintf("\tPrimary EC status: %s\n", primaryEcStatus)
+			clicolor.YellowPrintf("\tPrimary CC status: %s\n", primaryBcStatus)
+			fmt.Println()
+			return true, nil
+		}
+
+		// Both pairs aren't ready
+		fmt.Printf("Error: neither primary nor fallback client pairs are ready.\n\tPrimary EC status: %s\n\tFallback EC status: %s\n\tPrimary CC status: %s\n\tFallback CC status: %s\n", primaryEcStatus, fallbackEcStatus, primaryBcStatus, fallbackBcStatus)
+		return false, nil
+	}
+
+	// Primary isn't ready and fallback isn't enabled
+	fmt.Printf("Error: primary client pair isn't ready and fallback clients aren't enabled.\n\tPrimary EC status: %s\n\tPrimary CC status: %s\n", primaryEcStatus, primaryBcStatus)
+	return false, nil
+}
+
+func SetDefaults(g Globals) {
+	Defaults = g
+}
+
+// Create new Rocket Pool client from CLI context without checking for sync status
+// Only use this function from commands that may work if the Daemon service doesn't exist
+// Most users should call NewClient().WithStatus() or NewClient().WithReady()
+func NewClient() *Client {
+
+	// Return client
+	client := &Client{
+		globals: Defaults,
+	}
+
+	return client
+}
+
+// Check the status of a newly created client and return it
+// Only use this function from commands that may work without the clients being synced-
+// most users should use WithReady instead
+func (c *Client) WithStatus() (*Client, bool, error) {
+	ready, err := checkClientStatus(c)
+	if err != nil {
+		c.Close()
+		return nil, false, err
+	}
+
+	return c, ready, nil
+}
+
+// Check the status of a newly created client and ensure the eth clients are synced and ready
+func (c *Client) WithReady() (*Client, error) {
+	_, ready, err := c.WithStatus()
+	if err != nil {
+		return nil, err
+	}
+
+	if !ready {
+		c.Close()
+		return nil, fmt.Errorf("clients not ready")
+	}
+
+	return c, nil
+}
+
+// Close is a no-op retained for interface compatibility.
+func (c *Client) Close() {}
+
+func (c *Client) ConfigPath() string {
+	return c.globals.ConfigPath
+}
+
+// Load the config
+// Returns the RocketPoolConfig and whether or not it was newly generated
+func (c *Client) LoadConfig() (*config.RocketPoolConfig, bool, error) {
+	settingsFilePath := filepath.Join(c.ConfigPath(), SettingsFile)
+	expandedPath, err := homedir.Expand(settingsFilePath)
+	if err != nil {
+		return nil, false, fmt.Errorf("error expanding settings file path: %w", err)
+	}
+
+	cfg, err := config.LoadFromFile(expandedPath)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if cfg != nil {
+		cfg.IsCLI = true
+		if err := cfg.SyncAPITokenFromDisk(); err != nil {
+			return nil, false, err
+		}
+		return cfg, false, nil
+	}
+
+	// Config wasn't loaded, but there was no error- we should create one.
+	cfg, err = config.NewRocketPoolConfig(c.ConfigPath(), c.globals.DaemonPath != "")
+	if err != nil {
+		return nil, false, err
+	}
+	cfg.IsCLI = true
+	return cfg, true, nil
+}
+
+// Load the backup config
+func (c *Client) LoadBackupConfig() (*config.RocketPoolConfig, error) {
+	settingsFilePath := filepath.Join(c.ConfigPath(), BackupSettingsFile)
+	expandedPath, err := homedir.Expand(settingsFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("error expanding backup settings file path: %w", err)
+	}
+
+	return config.LoadFromFile(expandedPath)
+}
+
+// Save the config
+func (c *Client) SaveConfig(cfg *config.RocketPoolConfig) error {
+	settingsFileDirectoryPath, err := homedir.Expand(c.ConfigPath())
+	if err != nil {
+		return err
+	}
+	return cfg.Save(settingsFileDirectoryPath, SettingsFile)
+}
+
+// Remove the upgrade flag file
+func removeUpgradeFlagFile(configDir string) error {
+
+	// Check for the upgrade flag file
+	upgradeFilePath := filepath.Join(configDir, upgradeFlagFile)
+	_, err := os.Stat(upgradeFilePath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+
+	// Delete the upgrade flag file
+	err = os.Remove(upgradeFilePath)
+	if err != nil {
+		return fmt.Errorf("error removing upgrade flag file: %w", err)
+	}
+
+	return nil
+
+}
+
+// Remove the upgrade flag file
+func (c *Client) RemoveUpgradeFlagFile() error {
+	expandedPath, err := homedir.Expand(c.ConfigPath())
+	if err != nil {
+		return err
+	}
+	return removeUpgradeFlagFile(expandedPath)
+}
+
+// Checks if this is the first run of the configurator after an install
+func isFirstRun(configDir string) bool {
+	upgradeFilePath := filepath.Join(configDir, upgradeFlagFile)
+
+	// Load the config normally if the upgrade flag file isn't there
+	_, err := os.Stat(upgradeFilePath)
+	return !os.IsNotExist(err)
+}
+
+// Returns whether or not this is the first run of the configurator since a previous installation
+func (c *Client) IsFirstRun() (bool, error) {
+	expandedPath, err := homedir.Expand(c.ConfigPath())
+	if err != nil {
+		return false, fmt.Errorf("error expanding settings file path: %w", err)
+	}
+	return isFirstRun(expandedPath), nil
+}
+
+// Load the Prometheus template, do a template variable substitution, and save it
+func (c *Client) UpdatePrometheusConfiguration(config *config.RocketPoolConfig) error {
+	prometheusTemplatePath, err := homedir.Expand(fmt.Sprintf("%s/%s", c.ConfigPath(), PrometheusConfigTemplate))
+	if err != nil {
+		return fmt.Errorf("Error expanding Prometheus template path: %w", err)
+	}
+
+	prometheusConfigPath, err := homedir.Expand(fmt.Sprintf("%s/%s", c.ConfigPath(), PrometheusFile))
+	if err != nil {
+		return fmt.Errorf("Error expanding Prometheus config file path: %w", err)
+	}
+
+	t := template.Template{
+		Src: prometheusTemplatePath,
+		Dst: prometheusConfigPath,
+	}
+
+	return t.Write(config)
+}
+
+func (c *Client) runScript(script assets.ScriptWithContext, verbose bool, flags []string) error {
+	// Make a tmpdir
+	tmpdir, err := os.MkdirTemp("", "rocketpool-")
+	if err != nil {
+		return fmt.Errorf("error creating tmpdir: %w", err)
+	}
+	if verbose {
+		fmt.Printf("Verbose mode enabled, tmpdir %s will not be removed\n", tmpdir)
+	} else {
+		defer func() {
+			// It's fine if this fails, tmpreaper will handle it
+			_ = os.RemoveAll(tmpdir)
+		}()
+	}
+
+	// Create a file in the tmpdir
+	scriptPathName := filepath.Join(tmpdir, "script.sh")
+	scriptFile, err := os.Create(scriptPathName)
+	if err != nil {
+		return fmt.Errorf("error creating script file: %w", err)
+	}
+	if err := scriptFile.Chmod(0700); err != nil {
+		return fmt.Errorf("error setting script file permissions: %w", err)
+	}
+	// write the script to the file
+	_, err = scriptFile.Write(script.Script)
+	if err != nil {
+		return fmt.Errorf("error writing script to file: %w", err)
+	}
+	scriptFile.Close()
+
+	// Copy the context to the tmpdir
+	if err := os.CopyFS(tmpdir, script.Context); err != nil {
+		return fmt.Errorf("error copying script files: %w", err)
+	}
+
+	// Initialize command
+	cmdString := fmt.Sprintf("%s %s", scriptPathName, strings.Join(flags, " "))
+	if verbose {
+		fmt.Printf("Running script: %s\n", cmdString)
+	}
+	cmd, err := c.newCommand(cmdString)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = cmd.Close()
+	}()
+
+	// Get command output pipes
+	cmdOut, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	cmdErr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+
+	// Print progress from stdout
+	go (func() {
+		scanner := bufio.NewScanner(cmdOut)
+		for scanner.Scan() {
+			fmt.Println(scanner.Text())
+		}
+	})()
+
+	// Read command & error output from stderr; render in verbose mode
+	var errMessage string
+	go (func() {
+		c := color.New(DebugColor)
+		scanner := bufio.NewScanner(cmdErr)
+		for scanner.Scan() {
+			errMessage = scanner.Text()
+			if verbose {
+				_, _ = c.Println(scanner.Text())
+			}
+		}
+	})()
+
+	// Run command and return error output
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("Could not run script: %s", errMessage)
+	}
+	return nil
+
+}
+
+// Install the Rocket Pool service
+func (c *Client) InstallService(verbose, noDeps bool, path string, dataPath string) error {
+
+	// Get installation script flags
+	flags := []string{}
+	if path != "" {
+		flags = append(flags, fmt.Sprintf("-p %s", shellescape.Quote(path)))
+	}
+	if noDeps {
+		flags = append(flags, "-d")
+	}
+	if dataPath != "" {
+		flags = append(flags, fmt.Sprintf("-u %s", dataPath))
+	}
+
+	// Load the installation script
+	return c.runScript(assets.InstallScript(), verbose, flags)
+}
+
+// Install the update tracker
+func (c *Client) InstallUpdateTracker(verbose bool) error {
+
+	return c.runScript(assets.InstallUpdateTrackerScript(), verbose, nil)
+}
+
+// Start the Rocket Pool service
+func (c *Client) StartService(composeFiles []string) error {
+	cfg, isNew, err := c.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if !isNew {
+		if err := cfg.ValidateNetworkForStart(); err != nil {
+			return err
+		}
+	}
+
+	// Start all of the containers
+	cmd, err := c.compose(composeFiles, "up -d --remove-orphans --quiet-pull")
+	if err != nil {
+		return err
+	}
+	return c.printOutput(cmd)
+}
+
+// Pause the Rocket Pool service
+func (c *Client) PauseService(composeFiles []string) error {
+	cmd, err := c.compose(composeFiles, "stop")
+	if err != nil {
+		return err
+	}
+	return c.printOutput(cmd)
+}
+
+// Stop the Rocket Pool service
+func (c *Client) StopService(composeFiles []string) error {
+	cmd, err := c.compose(composeFiles, "down -v")
+	if err != nil {
+		return err
+	}
+	return c.printOutput(cmd)
+}
+
+// Stop the Rocket Pool service and remove the config folder
+func (c *Client) TerminateService(composeFiles []string, configPath string) error {
+
+	// Terminate the Docker containers
+	cmd, err := c.compose(composeFiles, "down -v")
+	if err != nil {
+		return fmt.Errorf("error creating Docker artifact removal command: %w", err)
+	}
+	err = c.printOutput(cmd)
+	if err != nil {
+		return fmt.Errorf("error removing Docker artifacts: %w", err)
+	}
+
+	// Delete the RP directory
+	path, err := homedir.Expand(configPath)
+	if err != nil {
+		return fmt.Errorf("error loading Rocket Pool directory: %w", err)
+	}
+	fmt.Printf("Deleting Rocket Pool directory (%s)...\n", path)
+	cmd = fmt.Sprintf("rm -rf %s", path)
+	// The directory contains root-owned paths, so delete it as root
+	_, err = c.readOutputSudo(cmd)
+	if err != nil {
+		return fmt.Errorf("error deleting Rocket Pool directory: %w", err)
+	}
+
+	fmt.Println("Termination complete.")
+
+	return nil
+}
+
+// Print the Rocket Pool service status
+func (c *Client) PrintServiceStatus(composeFiles []string) error {
+	cmd, err := c.compose(composeFiles, "ps")
+	if err != nil {
+		return err
+	}
+	return c.printOutput(cmd)
+}
+
+// Print the Rocket Pool service logs
+func (c *Client) PrintServiceLogs(composeFiles []string, tail, since, until string, serviceNames ...string) error {
+	cmd, err := c.compose(composeFiles, serviceLogsArgs(tail, since, until, serviceNames))
+	if err != nil {
+		return err
+	}
+	return c.printOutput(cmd)
+}
+
+// Build the docker compose arguments for the service logs command
+func serviceLogsArgs(tail, since, until string, serviceNames []string) string {
+	parts := []string{"logs"}
+	if until == "" {
+		parts = append(parts, "-f")
+	}
+	parts = append(parts, "--tail", shellescape.Quote(tail))
+	if since != "" {
+		parts = append(parts, "--since", shellescape.Quote(since))
+	}
+	if until != "" {
+		parts = append(parts, "--until", shellescape.Quote(until))
+	}
+	for _, serviceName := range serviceNames {
+		parts = append(parts, shellescape.Quote(serviceName))
+	}
+	return strings.Join(parts, " ")
+}
+
+// Print the Rocket Pool service compose config
+func (c *Client) PrintServiceCompose(composeFiles []string) error {
+	cmd, err := c.compose(composeFiles, "config")
+	if err != nil {
+		return err
+	}
+	return c.printOutput(cmd)
+}
+
+// Get the Rocket Pool service version
+func (c *Client) GetServiceVersion() (string, error) {
+	type versionResponse struct {
+		api.APIResponse
+		Version string `json:"version"`
+	}
+
+	response, err := c.callAPI[versionResponse]("GET", "/api/version", nil, "Could not get Rocket Pool service version")
+	if err != nil {
+		return "", err
+	}
+
+	version, err := semver.Make(response.Version)
+	if err != nil {
+		return "", fmt.Errorf("Could not parse Rocket Pool service version number '%s': %w", response.Version, err)
+	}
+	return version.String(), nil
+}
+
+// Increments the custom nonce parameter.
+// This is used for calls that involve multiple transactions, so they don't all have the same nonce.
+func (c *Client) IncrementCustomNonce() {
+	c.globals.CustomNonce.Add(c.globals.CustomNonce, big.NewInt(1))
+}
+
+// Get the current Docker image used by the given container
+func (c *Client) GetDockerImage(container string) (string, error) {
+
+	cmd := fmt.Sprintf("docker container inspect --format={{.Config.Image}} %s", container)
+	image, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(image)), nil
+
+}
+
+// Get the current Docker status of the given container
+func (c *Client) GetDockerStatus(container string) (string, error) {
+
+	cmd := fmt.Sprintf("docker container inspect --format={{.State.Status}} %s", container)
+	status, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(status)), nil
+
+}
+
+// Get the time that the given container shut down
+func (c *Client) GetDockerContainerShutdownTime(container string) (time.Time, error) {
+
+	cmd := fmt.Sprintf("docker container inspect --format={{.State.FinishedAt}} %s", container)
+	finishTimeBytes, err := c.readOutput(cmd)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	finishTime, err := time.Parse(time.RFC3339, strings.TrimSpace(string(finishTimeBytes)))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("Error parsing validator container exit time [%s]: %w", string(finishTimeBytes), err)
+	}
+
+	return finishTime, nil
+
+}
+
+// Shut down a container
+func (c *Client) StopContainer(container string) (string, error) {
+
+	cmd := fmt.Sprintf("docker stop %s", container)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+
+}
+
+// Check whether a container exists (running or stopped)
+func (c *Client) ContainerExists(container string) (bool, error) {
+
+	cmd := fmt.Sprintf("docker ps -a --filter name=^/%s$ --format {{.Names}}", container)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(output)) == container, nil
+
+}
+
+// Check whether a docker network exists
+func (c *Client) NetworkExists(network string) (bool, error) {
+
+	cmd := fmt.Sprintf("docker network ls --filter name=^%s$ --format {{.Name}}", network)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(output)) == network, nil
+
+}
+
+// Get the names of all containers (running or stopped) that are attached to the given network
+func (c *Client) GetContainersOnNetwork(network string) ([]string, error) {
+
+	cmd := fmt.Sprintf("docker network inspect --format='{{range .Containers}}{{println .Name}}{{end}}' %s", network)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	names := make([]string, 0, len(lines))
+	for _, l := range lines {
+		name := strings.TrimSpace(l)
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	return names, nil
+
+}
+
+// Check whether the given Docker network has IPv6 enabled
+func (c *Client) GetNetworkIPv6Enabled(network string) (bool, error) {
+
+	cmd := fmt.Sprintf("docker network inspect --format='{{.EnableIPv6}}' %s", network)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(output)) == "true", nil
+
+}
+
+// Remove a docker network
+func (c *Client) RemoveNetwork(network string) (string, error) {
+
+	cmd := fmt.Sprintf("docker network rm %s", network)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+
+}
+
+// Start a container
+func (c *Client) StartContainer(container string) (string, error) {
+
+	cmd := fmt.Sprintf("docker start %s", container)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+
+}
+
+// Restart a container
+func (c *Client) RestartContainer(container string) (string, error) {
+
+	cmd := fmt.Sprintf("docker restart %s", container)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+
+}
+
+// Deletes a container
+func (c *Client) RemoveContainer(container string) (string, error) {
+
+	cmd := fmt.Sprintf("docker rm %s", container)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+
+}
+
+// Deletes a docker volume
+func (c *Client) DeleteVolume(volume string) (string, error) {
+
+	cmd := fmt.Sprintf("docker volume rm %s", volume)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+
+}
+
+// Deletes a docker image
+func (c *Client) DeleteDockerImage(id string) (string, error) {
+
+	cmd := fmt.Sprintf("docker image rm %s", shellescape.Quote(id))
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+
+}
+
+// Runs docker system prune remove all unused containers, networks, and unused images
+func (c *Client) DockerSystemPrune(deleteAllImages bool) error {
+
+	// NOTE: explicitly *NOT* using the --all flag, as it would remove all images,
+	//   not just unused ones, and we use this command to preserve the current
+	//   smartnode stack images.
+	cmd := "docker system prune -f"
+	if deleteAllImages {
+		cmd += " --all"
+	}
+	err := c.printOutput(cmd)
+	if err != nil {
+		return fmt.Errorf("error running docker system prune: %w", err)
+	}
+	return nil
+}
+
+// Returns the images used by each service in compose file in "repository:tag"
+// format (assuming that is the format specified in the compose files)
+func (c *Client) GetComposeImages(composeFiles []string) ([]string, error) {
+	cmd, err := c.compose(composeFiles, "config --images")
+	if err != nil {
+		return nil, err
+	}
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(string(output)), nil
+}
+
+func (c *Client) PullComposeImages(composeFiles []string) error {
+	cmd, err := c.compose(composeFiles, "pull -q")
+	if err != nil {
+		return err
+	}
+	err = c.printOutput(cmd)
+	if err != nil {
+		return fmt.Errorf("error pulling images: %w", err)
+	}
+	return nil
+}
+
+type DockerImage struct {
+	Repository string `json:"Repository"`
+	Tag        string `json:"Tag"`
+	ID         string `json:"ID"`
+}
+
+func (img *DockerImage) TagString() string {
+	return fmt.Sprintf("%s:%s", img.Repository, img.Tag)
+}
+
+func (img *DockerImage) String() string {
+	return fmt.Sprintf("%s:%s (%s)", img.Repository, img.Tag, img.ID)
+}
+
+// Returns all Docker images on the system
+func (c *Client) GetAllDockerImages() ([]DockerImage, error) {
+	cmd := "docker images -a --format json"
+	responseBytes, err := c.readOutput(cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	// docker images output puts each image as a json object on a new line (JSONL)
+	var images []DockerImage
+	lines := strings.SplitSeq(string(responseBytes), "\n")
+	for line := range lines {
+		if line == "" {
+			continue
+		}
+		var image DockerImage
+		if err := json.Unmarshal([]byte(line), &image); err != nil {
+			return nil, fmt.Errorf("could not decode docker image: %w", err)
+		}
+		images = append(images, image)
+	}
+
+	return images, nil
+}
+
+type DockerContainer struct {
+	Names  string `json:"Names"`
+	State  string `json:"State"`
+	Mounts string `json:"Mounts"`
+}
+
+func (c *DockerContainer) HasVolume(volume string) bool {
+	mounts := strings.Split(c.Mounts, ",")
+	return slices.Contains(mounts, volume)
+}
+
+// Returns all Docker containers on the system with the given prefix
+func (c *Client) GetContainersByPrefix(prefix string) ([]DockerContainer, error) {
+	cmd := fmt.Sprintf("docker container ls -a --no-trunc --format json --filter label=com.docker.compose.project=%s", prefix)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	// docker container ls output puts each container as a json object on a new line (JSONL)
+	lines := strings.Split(string(output), "\n")
+	out := make([]DockerContainer, 0, len(lines))
+	for _, l := range lines {
+		if l == "" {
+			continue
+		}
+		var container DockerContainer
+		if err := json.Unmarshal([]byte(l), &container); err != nil {
+			return nil, fmt.Errorf("could not decode docker container: %w", err)
+		}
+		out = append(out, container)
+	}
+	return out, nil
+}
+
+// Gets the absolute file path of the client volume
+func (c *Client) GetClientVolumeSource(container string, volumeTarget string) (string, error) {
+
+	cmd := fmt.Sprintf("docker container inspect --format='{{range .Mounts}}{{if eq \"%s\" .Destination}}{{.Source}}{{end}}{{end}}' %s", volumeTarget, container)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// Gets the name of the client volume
+func (c *Client) GetClientVolumeName(container string, volumeTarget string) (string, error) {
+
+	cmd := fmt.Sprintf("docker container inspect --format='{{range .Mounts}}{{if eq \"%s\" .Destination}}{{.Name}}{{end}}{{end}}' %s", volumeTarget, container)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// A docker volume and its disk usage
+type VolumeSize struct{ Name, Size string }
+
+// Gets the disk usage of the volumes of a compose project, sorted by name
+func (c *Client) GetVolumeSizes(projectName string) ([]VolumeSize, error) {
+
+	cmd := `docker system df -v --format '{{range .Volumes}}{{.Name}}\t{{.Label "com.docker.compose.project"}}\t{{.Size}}\n{{end}}'`
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		if exitErr, isExitErr := err.(*exec.ExitError); isExitErr {
+			if msg := strings.TrimSpace(string(exitErr.Stderr)); msg != "" {
+				return nil, errors.New(msg)
+			}
+		}
+		return nil, err
+	}
+	return parseVolumeSizes(string(output), projectName)
+}
+
+// Parses the volume list printed by docker system df for the given compose project
+func parseVolumeSizes(output, projectName string) ([]VolumeSize, error) {
+	var sizes []VolumeSize
+	for line := range strings.SplitSeq(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("unexpected volume line from docker: %q", line)
+		}
+		if fields[1] != projectName {
+			continue
+		}
+		sizes = append(sizes, VolumeSize{Name: fields[0], Size: fields[2]})
+	}
+	slices.SortFunc(sizes, func(a, b VolumeSize) int { return strings.Compare(a.Name, b.Name) })
+	return sizes, nil
+}
+
+// Runs the prune provisioner
+func (c *Client) RunPruneProvisioner(container, volume string) error {
+	return c.TouchEthclientMarker(container, volume, "prune.lock")
+}
+
+func (c *Client) resolvedImage(key, fallback string) string {
+	cfg, _, err := c.LoadConfig()
+	if err != nil || cfg == nil {
+		return fallback
+	}
+	if v := cfg.ResolvedImage(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// Creates a marker file on the execution client volume (used for prune and DB migrations).
+func (c *Client) TouchEthclientMarker(container, volume, marker string) error {
+	cmd := fmt.Sprintf("docker run --rm --log-driver json-file --log-opt max-size=100m --log-opt max-file=3 --name %s -v %s:/ethclient %s sh -c 'touch /ethclient/%s'", container, volume, shellescape.Quote(c.resolvedImage(config.ImageAlpine, "alpine:3.24.4")), marker)
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return err
+	}
+
+	outputString := strings.TrimSpace(string(output))
+	if outputString != "" {
+		return fmt.Errorf("Unexpected output creating marker %s: %s", marker, outputString)
+	}
+
+	return nil
+}
+
+// NethermindDBLayout inspects the execution container's persisted state using the
+// same detector as client startup. Errors must not be treated as Patricia.
+func (c *Client) NethermindDBLayout(executionContainerName string) (string, error) {
+	cmd := fmt.Sprintf("docker exec %s sh /setup/nethermind-db.sh", shellescape.Quote(executionContainerName))
+	output, err := c.readOutput(cmd)
+	if err != nil {
+		return "", fmt.Errorf("could not inspect Nethermind state database (the execution container must be running): %w", err)
+	}
+	layout := strings.TrimSpace(string(output))
+	switch layout {
+	case "patricia", "flat", "none":
+		return layout, nil
+	default:
+		return "", fmt.Errorf("unexpected Nethermind database layout: %q", layout)
+	}
+}
+
+// Curls the Nethermind admin URL to trigger pruning
+// TODO(Hegota): Remove RunNethermindPruneStarter when dropping Patricia pruning.
+func (c *Client) RunNethermindPruneStarter(executionContainerName string) error {
+	retryCount := 5
+	retryTime := 3 * time.Second
+
+	for i := 0; i < retryCount; i++ {
+		command := fmt.Sprintf(`-m 30 -H "Content-Type: application/json" -X POST --data '{"jsonrpc":"2.0","method":"admin_prune","params":[],"id":%d}' %s`, i+1, nethermindAdminUrl)
+		cmdText := fmt.Sprintf(`docker run --quiet --rm --log-driver json-file --log-opt max-size=100m --log-opt max-file=3 --name curl%s --network container:%s %s -Ss %s`, pruneStarterContainerSuffix, executionContainerName, shellescape.Quote(c.resolvedImage(config.ImageCurl, "curlimages/curl:8.23.0")), command)
+
+		if i != 0 {
+			fmt.Printf("Trying again in %v... (%d/%d)\n", retryTime, i+1, retryCount)
+			time.Sleep(retryTime)
+		}
+
+		cmd, err := c.newCommand(cmdText)
+		if err != nil {
+			return fmt.Errorf("error creating command for prune starter: %w", err)
+		}
+
+		stdOut, stdErr, err := cmd.OutputPipes()
+		if err != nil {
+			return fmt.Errorf("error getting output pipes for prune starter: %w", err)
+		}
+
+		err = cmd.Start()
+		if err != nil {
+			return fmt.Errorf("error running prune starter: %w", err)
+		}
+		defer func() {
+			_ = cmd.Wait()
+		}()
+
+		// Check for a curl error
+		stdErrTextBytes, err := io.ReadAll(stdErr)
+		if err != nil {
+			return fmt.Errorf("error reading error from prune starter: %w", err)
+		}
+		stdErrText := string(stdErrTextBytes)
+		if stdErrText != "" {
+			fmt.Printf("Error while curling the Nethermind admin URL: %s\n", stdErrText)
+			continue
+		}
+
+		// Grab the response
+		stdOutText, err := io.ReadAll(stdOut)
+		if err != nil {
+			return fmt.Errorf("error reading response from prune starter: %w", err)
+		}
+		// Parse the response as JSON
+		var response map[string]any
+		err = json.Unmarshal(stdOutText, &response)
+		if err != nil {
+			return fmt.Errorf("error parsing response from prune starter: %w", err)
+		}
+
+		if errObject, ok := response["error"].(map[string]any); ok {
+			fmt.Printf("Error starting prune: code %d, message = %s, data = %s\n", errObject["code"], errObject["message"], errObject["data"])
+			continue
+		}
+
+		fmt.Printf("Success: Pruning is now \"%s\"\n", response["result"])
+		fmt.Println("Your main execution client is now pruning. You can follow its progress with `rocketpool service logs eth1`.")
+		fmt.Println("NOTE: While pruning, you **cannot** interrupt the client (e.g. by restarting) or you risk corrupting the database!")
+		fmt.Println("You must let it run to completion!")
+		break
+
+	}
+	return nil
+}
+
+// Deletes the node wallet and all validator keys, and restarts the Docker containers
+func (c *Client) PurgeAllKeys(composeFiles []string) error {
+
+	// Get the config
+	cfg, _, err := c.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("error loading user settings: %w", err)
+	}
+
+	// Check for Native mode
+	if cfg.IsNativeMode {
+		return fmt.Errorf("this function is not supported in Native Mode; you will have to shut down your client and daemon services and remove the keys manually")
+	}
+
+	// Shut down the containers
+	fmt.Println("Stopping containers...")
+	err = c.PauseService(composeFiles)
+	if err != nil {
+		return fmt.Errorf("error stopping Docker containers: %w", err)
+	}
+
+	// Delete the wallet
+	walletPath, err := homedir.Expand(cfg.Smartnode.GetWalletPathInCLI())
+	if err != nil {
+		return fmt.Errorf("error loading wallet path: %w", err)
+	}
+	fmt.Println("Deleting wallet...")
+	cmd := fmt.Sprintf("rm -f %s", walletPath)
+	// The file is owned by root, so delete as root
+	_, err = c.readOutputSudo(cmd)
+	if err != nil {
+		return fmt.Errorf("error deleting wallet: %w", err)
+	}
+
+	// Delete the password
+	passwordPath, err := homedir.Expand(cfg.Smartnode.GetPasswordPathInCLI())
+	if err != nil {
+		return fmt.Errorf("error loading password path: %w", err)
+	}
+	fmt.Println("Deleting password...")
+	cmd = fmt.Sprintf("rm -f %s", passwordPath)
+	// The file is owned by root, so delete as root
+	_, err = c.readOutputSudo(cmd)
+	if err != nil {
+		return fmt.Errorf("error deleting password: %w", err)
+	}
+
+	// Delete the validators dir
+	validatorsPath, err := homedir.Expand(cfg.Smartnode.GetValidatorKeychainPathInCLI())
+	if err != nil {
+		return fmt.Errorf("error loading validators folder path: %w", err)
+	}
+	fmt.Println("Deleting validator keys...")
+	cmd = fmt.Sprintf("rm -rf %s/*", validatorsPath)
+	// The validators path can be created by the smartnode daemon (owned by root, 0600)
+	// So delete its contents as root, otherwise the * won't expand.
+	// NB: we delete the contents of the folder instead of recreating the folder
+	// This way, if the drive is full, we don't release the directory inode and fail to recreate it.
+	_, err = c.readOutputSudo(cmd)
+	if err != nil {
+		return fmt.Errorf("error deleting validator keys: %w", err)
+	}
+	// Also delete hidden files
+	cmd = fmt.Sprintf("rm -rf %s/.[a-zA-Z0-9]*", validatorsPath)
+	// also as root, so bash can expand the regex
+	_, err = c.readOutputSudo(cmd)
+	if err != nil {
+		return fmt.Errorf("error deleting hidden files in validator folder: %w", err)
+	}
+
+	// Start the containers
+	fmt.Println("Starting containers...")
+	err = c.StartService(composeFiles)
+	if err != nil {
+		return fmt.Errorf("error starting Docker containers: %w", err)
+	}
+
+	fmt.Println("Purge complete.")
+
+	return nil
+}
+
+// Get the gas settings
+func (c *Client) GetGasSettings() (float64, float64, uint64) {
+	return c.globals.MaxFee, c.globals.MaxPrioFee, c.globals.GasLimit
+}
+
+// Get the gas fees
+func (c *Client) AssignGasSettings(maxFee float64, maxPrioFee float64, gasLimit uint64) {
+	c.globals.MaxFee = maxFee
+	c.globals.MaxPrioFee = maxPrioFee
+	c.globals.GasLimit = gasLimit
+}
+
+// Set the flags for ignoring EC and CC sync checks and forcing fallbacks to prevent unnecessary duplication of effort by the API during CLI commands
+func (c *Client) checkIfCommandExists(command string) (bool, error) {
+	// Run `type` to check for existence
+	cmd := fmt.Sprintf("type %s", command)
+	output, err := c.readOutput(cmd)
+
+	if err != nil {
+		exitErr, isExitErr := err.(*exec.ExitError)
+		if isExitErr && exitErr.ExitCode() == 127 {
+			// Command not found
+			return false, nil
+		}
+		return false, fmt.Errorf("error checking if %s exists: %w", command, err)
+	}
+	if strings.Contains(string(output), fmt.Sprintf("%s is", command)) {
+		return true, nil
+	}
+	return false, fmt.Errorf("unexpected output when checking for %s: %s", command, string(output))
+}
+
+// Build a docker compose command
+func (c *Client) compose(composeFiles []string, args string) (string, error) {
+
+	// Cancel if running in non-docker mode
+	if c.globals.DaemonPath != "" {
+		return "", errors.New("command unavailable in Native Mode (with '--daemon-path' option specified)")
+	}
+
+	// Get the expanded config path
+	expandedConfigPath, err := homedir.Expand(c.ConfigPath())
+	if err != nil {
+		return "", err
+	}
+	expandedConfigPath, err = filepath.Abs(expandedConfigPath)
+	if err != nil {
+		return "", err
+	}
+
+	// Load config
+	cfg, isNew, err := c.LoadConfig()
+	if err != nil {
+		return "", err
+	}
+
+	if isNew {
+		return "", fmt.Errorf("Settings file not found. Please run `rocketpool service config` to set up your Smart Node before starting it.")
+	}
+
+	// Check config
+	if cfg.ExecutionClientMode.Value.(cfgtypes.Mode) == cfgtypes.Mode_Unknown {
+		return "", fmt.Errorf("You haven't selected local or external mode for your Execution (ETH1) client.\nPlease run 'rocketpool service config' before running this command.")
+	} else if cfg.ExecutionClientMode.Value.(cfgtypes.Mode) == cfgtypes.Mode_Local && cfg.ExecutionClient.Value.(cfgtypes.ExecutionClient) == cfgtypes.ExecutionClient_Unknown {
+		return "", errors.New("No Execution (ETH1) client selected. Please run 'rocketpool service config' before running this command.")
+	}
+	if cfg.ConsensusClientMode.Value.(cfgtypes.Mode) == cfgtypes.Mode_Unknown {
+		return "", fmt.Errorf("You haven't selected local or external mode for your Consensus (ETH2) client.\nPlease run 'rocketpool service config' before running this command.")
+	} else if cfg.ConsensusClientMode.Value.(cfgtypes.Mode) == cfgtypes.Mode_Local && cfg.ConsensusClient.Value.(cfgtypes.ConsensusClient) == cfgtypes.ConsensusClient_Unknown {
+		return "", errors.New("No Consensus (ETH2) client selected. Please run 'rocketpool service config' before running this command.")
+	}
+
+	// Deploy the templates and run environment variable substitution on them
+	deployedContainers, err := c.deployTemplates(cfg, expandedConfigPath)
+	if err != nil {
+		return "", fmt.Errorf("error deploying Docker templates: %w", err)
+	}
+
+	composePath, err := writeComposeFile(cfg, expandedConfigPath, deployedContainers, composeFiles)
+	if err != nil {
+		return "", fmt.Errorf("error writing compose.yml: %w", err)
+	}
+
+	envPrefix := []string{
+		"COMPOSE_PROJECT_NAME=" + shellescape.Quote(cfg.Smartnode.ProjectName.Value.(string)),
+	}
+	assignments, err := cfg.ComposeEnvAssignments()
+	if err != nil {
+		return "", err
+	}
+	envPrefix = append(envPrefix, assignments...)
+
+	parts := append(envPrefix, "docker compose",
+		"--project-directory", shellescape.Quote(expandedConfigPath),
+		"-f", shellescape.Quote(composePath),
+		args,
+	)
+	return strings.Join(parts, " "), nil
+
+}
+
+func ensureImageEnvFiles(dir string) error {
+	official := []string{config.ImagesMainnetFile, config.ImagesTestnetFile, config.ImagesDevnetFile, config.ImagesPlatabergetFile}
+	for _, name := range official {
+		data, ok := assets.EmbeddedNetworkEnv(name)
+		if !ok && name == config.ImagesMainnetFile {
+			data = assets.ImagesMainnetEnv()
+			ok = true
+		}
+		if !ok {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if _, err := os.Stat(path); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("could not stat %s: %w", path, err)
+		}
+		if err := os.WriteFile(path, data, 0664); err != nil {
+			return fmt.Errorf("could not write %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+type composeTemplateData struct {
+	Paths      []string
+	ProjectDir string
+	EnvFiles   []string
+}
+
+// Merge the entire application in one include path list. Splitting it into
+// includes changes precedence for services and shared networks/volumes.
+func writeComposeFile(cfg *config.RocketPoolConfig, projectDir string, deployed, extra []string) (string, error) {
+	if err := ensureImageEnvFiles(projectDir); err != nil {
+		return "", err
+	}
+	data := composeTemplateData{
+		Paths:      append(slices.Clone(deployed), filepath.Join(projectDir, overrideDir, config.ComposeMainFile)),
+		ProjectDir: projectDir,
+	}
+	for _, path := range extra {
+		// CLI -f paths are relative to the working directory, not the include.
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+		data.Paths = append(data.Paths, absolute)
+	}
+	for _, name := range cfg.ImagesEnvFiles() {
+		data.EnvFiles = append(data.EnvFiles, filepath.Join(projectDir, name))
+	}
+	// Resolve the selected client aliases after mainnet and the network overlay
+	// have been loaded by Compose. Only TUI overrides go in the shell environment.
+	imageEnv := filepath.Join(projectDir, runtimeDir, config.ComposeImageEnvFile)
+	if err := config.WriteEnvFile(imageEnv, cfg.ComposeImageDefaultRefs()); err != nil {
+		return "", fmt.Errorf("could not write image aliases: %w", err)
+	}
+	data.EnvFiles = append(data.EnvFiles, imageEnv)
+	tmpl := template.Template{
+		Src: filepath.Join(projectDir, templatesDir, "compose.tmpl"),
+		Dst: filepath.Join(projectDir, runtimeDir, config.ComposeMainFile),
+	}
+	if err := tmpl.Write(data); err != nil {
+		return "", err
+	}
+	return tmpl.Dst, nil
+}
+
+// Deploys all of the appropriate docker compose template files and provisions them based on the provided configuration
+func (c *Client) deployTemplates(cfg *config.RocketPoolConfig, rocketpoolDir string) ([]string, error) {
+
+	// Check for the folders
+	runtimeFolder := filepath.Join(rocketpoolDir, runtimeDir)
+	templatesFolder := filepath.Join(rocketpoolDir, templatesDir)
+	_, err := os.Stat(templatesFolder)
+	if os.IsNotExist(err) {
+		return []string{}, fmt.Errorf("templates folder [%s] does not exist", templatesFolder)
+	}
+	overrideFolder := filepath.Join(rocketpoolDir, overrideDir)
+	_, err = os.Stat(overrideFolder)
+	if os.IsNotExist(err) {
+		return []string{}, fmt.Errorf("override folder [%s] does not exist", overrideFolder)
+	}
+
+	// Clear out the runtime folder and remake it
+	err = os.RemoveAll(runtimeFolder)
+	if err != nil {
+		return []string{}, fmt.Errorf("error deleting runtime folder [%s]: %w", runtimeFolder, err)
+	}
+	err = os.Mkdir(runtimeFolder, 0775)
+	if err != nil {
+		return []string{}, fmt.Errorf("error creating runtime folder [%s]: %w", runtimeFolder, err)
+	}
+
+	composePaths := template.ComposePaths{
+		RuntimePath:  runtimeFolder,
+		TemplatePath: templatesFolder,
+		OverridePath: overrideFolder,
+	}
+
+	// Read and substitute the templates
+	deployedContainers := []string{}
+
+	// Keep the HTTP API available for client status and service management.
+	toDeploy := []string{config.NodeContainerName}
+	if cfg.HasRocketPoolContracts() {
+		toDeploy = append(toDeploy, config.WatchtowerContainerName, config.ValidatorContainerName)
+	}
+
+	// Check if we are running the Execution Layer locally
+	if cfg.ExecutionClientMode.Value.(cfgtypes.Mode) == cfgtypes.Mode_Local {
+		toDeploy = append(toDeploy, config.Eth1ContainerName)
+	}
+
+	// Check if we are running the Consensus Layer locally
+	if cfg.ConsensusClientMode.Value.(cfgtypes.Mode) == cfgtypes.Mode_Local {
+		toDeploy = append(toDeploy, config.Eth2ContainerName)
+	}
+
+	// Check the metrics containers
+	if cfg.EnableMetrics.Value == true {
+		toDeploy = append(toDeploy,
+			config.GrafanaContainerName,
+			config.ExporterContainerName,
+			config.PrometheusContainerName,
+		)
+	}
+
+	// Check if Alerts are enabled
+	if cfg.Alertmanager.EnableAlerting.Value == true {
+		toDeploy = append(toDeploy,
+			config.AlertmanagerContainerName,
+		)
+	}
+
+	// Check if we are running the Mev-Boost container locally
+	if cfg.EnableMevBoost.Value == true && cfg.MevBoost.Mode.Value.(cfgtypes.Mode) == cfgtypes.Mode_Local {
+		toDeploy = append(toDeploy, config.MevBoostContainerName)
+	}
+
+	// Check if we are running the Commit-Boost container locally
+	if cfg.EnableCommitBoost.Value == true && cfg.CommitBoost.Mode.Value.(cfgtypes.Mode) == cfgtypes.Mode_Local {
+		toDeploy = append(toDeploy, config.CommitBoostContainerName)
+
+		// Render the Commit-Boost PBS config file (cb_config.toml)
+		cbConfigTmpl := template.Template{
+			Src: filepath.Join(templatesFolder, config.CommitBoostConfigTemplate+".tmpl"),
+			Dst: filepath.Join(runtimeFolder, config.CommitBoostConfigFile),
+		}
+		if err := cbConfigTmpl.Write(cfg); err != nil {
+			return []string{}, fmt.Errorf("could not render Commit-Boost config file: %w", err)
+		}
+	}
+
+	for _, containerName := range toDeploy {
+		containers, err := composePaths.File(containerName).Write(cfg)
+		if err != nil {
+			return []string{}, fmt.Errorf("could not create %s container definition: %w", containerName, err)
+		}
+		deployedContainers = append(deployedContainers, containers...)
+	}
+
+	// Create the custom keys dir
+	customKeyDir, err := homedir.Expand(filepath.Join(cfg.Smartnode.DataPath.Value.(string), "custom-keys"))
+	if err != nil {
+		clicolor.YellowPrintf("WARNING: Couldn't expand the custom validator key directory (%s). You will not be able to recover any minipool keys you created outside of the Smart Node until you create the folder manually.\n", err.Error())
+		return deployedContainers, nil
+	}
+	err = os.MkdirAll(customKeyDir, 0775)
+	if err != nil {
+		clicolor.YellowPrintf("WARNING: Couldn't create the custom validator key directory (%s). You will not be able to recover any minipool keys you created outside of the Smart Node until you create the folder [%s] manually.\n", err.Error(), customKeyDir)
+	}
+
+	// Create the rewards file dir
+	rewardsFileDir, err := homedir.Expand(cfg.Smartnode.GetRewardsTreeDirectory(false))
+	if err != nil {
+		clicolor.YellowPrintf("WARNING: Couldn't expand the rewards tree file directory (%s). You will not be able to view or claim your rewards until you create the folder manually.\n", err.Error())
+		return deployedContainers, nil
+	}
+	err = os.MkdirAll(rewardsFileDir, 0775)
+	if err != nil {
+		clicolor.YellowPrintf("WARNING: Couldn't create the rewards tree file directory (%s). You will not be able to view or claim your rewards until you create the folder [%s] manually.\n", err.Error(), rewardsFileDir)
+	}
+
+	return c.composeAddons(cfg, rocketpoolDir, deployedContainers)
+
+}
+
+// Handle composing for addons
+func (c *Client) composeAddons(cfg *config.RocketPoolConfig, rocketpoolDir string, deployedContainers []string) ([]string, error) {
+
+	// GWW
+	if cfg.GraffitiWallWriter.GetEnabledParameter().Value == true {
+
+		composePaths := template.ComposePaths{
+			RuntimePath:  filepath.Join(rocketpoolDir, runtimeDir, "addons", "gww"),
+			TemplatePath: filepath.Join(rocketpoolDir, templatesDir, "addons", "gww"),
+			OverridePath: filepath.Join(rocketpoolDir, overrideDir, "addons", "gww"),
+		}
+
+		// Make the addon folder
+		err := os.MkdirAll(composePaths.RuntimePath, 0775)
+		if err != nil {
+			return []string{}, fmt.Errorf("error creating addon runtime folder (%s): %w", composePaths.RuntimePath, err)
+		}
+
+		containers, err := composePaths.File(graffiti_wall_writer.GraffitiWallWriterContainerName).Write(cfg)
+		if err != nil {
+			return []string{}, fmt.Errorf("could not create gww container definition: %w", err)
+		}
+		deployedContainers = append(deployedContainers, containers...)
+	}
+
+	return deployedContainers, nil
+
+}
+
+func (c *Client) loadAPIAuth() {
+	c.apiURLOnce.Do(func() {
+		cfg, _, err := c.LoadConfig()
+		if err != nil {
+			c.apiAuthErr = err
+			return
+		}
+		port, ok := cfg.Api.ApiPort.Value.(uint16)
+		if !ok || port == 0 {
+			return
+		}
+		c.apiURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+		if err := cfg.SyncAPITokenFromDisk(); err != nil {
+			c.apiAuthErr = err
+			return
+		}
+		token, _ := cfg.Api.APIToken.Value.(string)
+		c.apiToken = token
+		c.apiTokenPath = cfg.Api.GetAPITokenPath()
+	})
+}
+
+// callHTTPAPI calls the node's HTTP API server with a 5-minute safety timeout.
+// method is "GET" or "POST".
+// path is the URL path, e.g. "/api/node/status".
+// params are appended as query string parameters for GET or as a form body for POST.
+// The response body is returned as-is; callers unmarshal it the same way
+func (c *Client) callHTTPAPI(method, path string, params url.Values) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	return c.callHTTPAPICtx(ctx, method, path, params)
+}
+
+// callHTTPAPICtx is the context-aware core of callHTTPAPI.  Use it directly
+// when a tighter deadline is required (e.g. optional/informational requests
+// that must not block the user).
+func (c *Client) callHTTPAPICtx(ctx context.Context, method, path string, params url.Values) ([]byte, error) {
+	c.loadAPIAuth()
+	if c.apiAuthErr != nil {
+		return nil, fmt.Errorf("could not load API token: %w", c.apiAuthErr)
+	}
+	base := c.apiURL
+	if base == "" {
+		return nil, fmt.Errorf("node HTTP API URL is not configured (APIPort may be 0)")
+	}
+
+	target := base + path
+
+	var req *http.Request
+	var err error
+	switch method {
+	case http.MethodGet:
+		if len(params) > 0 {
+			target += "?" + params.Encode()
+		}
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	case http.MethodPost:
+		if params == nil {
+			params = url.Values{}
+		}
+		// Propagate the gas settings
+		if c.globals.MaxFee > 0 {
+			params.Set("maxFee", strconv.FormatFloat(c.globals.MaxFee, 'f', -1, 64))
+		}
+		if c.globals.MaxPrioFee > 0 {
+			params.Set("maxPrioFee", strconv.FormatFloat(c.globals.MaxPrioFee, 'f', -1, 64))
+		}
+		if c.globals.GasLimit > 0 {
+			params.Set("gasLimit", strconv.FormatFloat(float64(c.globals.GasLimit), 'f', 0, 64))
+		}
+		if c.globals.CustomNonce != nil {
+			params.Set("nonce", c.globals.CustomNonce.String())
+		}
+		body := []byte(params.Encode())
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+	default:
+		return nil, fmt.Errorf("unsupported HTTP method: %s", method)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error building HTTP request for %s %s: %w", method, path, err)
+	}
+
+	if c.apiToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiToken)
+	}
+
+	if c.globals.DebugPrint {
+		fmt.Printf("HTTP API: %s %s\n", method, target)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error calling HTTP API %s %s: %w", method, path, err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	responseBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading HTTP API response for %s %s: %w", method, path, err)
+	}
+
+	if c.globals.DebugPrint {
+		fmt.Printf("HTTP API response (%d): %s\n", resp.StatusCode, string(responseBytes))
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized {
+			if c.apiTokenPath != "" {
+				return nil, fmt.Errorf("API unauthorized: CLI token file %s does not match the node daemon. Point -c at the same config directory the daemon is using, or copy that install's data/api-tokens.json", c.apiTokenPath)
+			}
+			return nil, errors.New("API unauthorized: check the API Token under the API category in `rocketpool service config`")
+		}
+		var apiErr struct {
+			Error string `json:"error"`
+		}
+		if jerr := json.Unmarshal(responseBytes, &apiErr); jerr == nil && apiErr.Error != "" {
+			return nil, errors.New(apiErr.Error)
+		}
+
+		return nil, fmt.Errorf("HTTP API %s %s returned status %d: %s", method, path, resp.StatusCode, string(responseBytes))
+	}
+
+	return responseBytes, nil
+}
+
+// Run a command and print its output
+func (c *Client) printOutput(cmdText string) error {
+
+	// Initialize command
+	cmd, err := c.newCommand(cmdText)
+	if err != nil {
+		return err
+	}
+	defer cmd.Close() //nolint:errcheck
+
+	cmd.SetStdout(os.Stdout)
+	cmd.SetStderr(os.Stderr)
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	// Wait for the command to exit
+	return cmd.Wait()
+
+}
+
+// Run a command as root and return its output
+func (c *Client) readOutputSudo(rootCmdText string) ([]byte, error) {
+	var escCmd string
+	for _, escalationCommand := range []string{"sudo", "doas"} {
+		exists, err := c.checkIfCommandExists(escalationCommand)
+		if err != nil {
+			return nil, fmt.Errorf("error checking if %s exists: %w", escalationCommand, err)
+		}
+		if exists {
+			escCmd = escalationCommand
+			break
+		}
+	}
+	if escCmd == "" {
+		return nil, fmt.Errorf("no privilege escalation command found")
+	}
+
+	return c.readOutput(fmt.Sprintf("%s bash -c %s", escCmd, shellescape.Quote(rootCmdText)))
+}
+
+// Run a command and return its output
+func (c *Client) readOutput(cmdText string) ([]byte, error) {
+
+	// Initialize command
+	cmd, err := c.newCommand(cmdText)
+	if err != nil {
+		return []byte{}, err
+	}
+	defer func() {
+		_ = cmd.Close()
+	}()
+
+	// Run command and return output
+	return cmd.Output()
+
+}
+
+// Gets the container prefix from the settings
+func (c *Client) GetContainerPrefix() (string, error) {
+	cfg, isNew, err := c.LoadConfig()
+	if err != nil {
+		return "", err
+	}
+	if isNew {
+		return "", fmt.Errorf("Settings file not found. Please run `rocketpool service config` to set up your Smart Node.")
+	}
+
+	return cfg.Smartnode.ProjectName.Value.(string), nil
+}

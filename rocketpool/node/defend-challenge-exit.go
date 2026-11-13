@@ -1,0 +1,242 @@
+package node
+
+import (
+	"fmt"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	coretypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/moby/moby/client"
+	"github.com/urfave/cli/v3"
+
+	"github.com/rocket-pool/smartnode/bindings/megapool"
+	"github.com/rocket-pool/smartnode/bindings/rocketpool"
+	"github.com/rocket-pool/smartnode/bindings/transactions"
+	"github.com/rocket-pool/smartnode/bindings/transactions/gaslimit"
+	"github.com/rocket-pool/smartnode/bindings/types"
+
+	log "github.com/rocket-pool/smartnode/shared/logger"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/services/beacon"
+	"github.com/rocket-pool/smartnode/shared/services/config"
+	rpgas "github.com/rocket-pool/smartnode/shared/services/gas"
+	"github.com/rocket-pool/smartnode/shared/services/state"
+	"github.com/rocket-pool/smartnode/shared/services/wallet"
+)
+
+// Stake megapool validator task
+type defendChallengeExit struct {
+	c              *cli.Command
+	log            log.ColorLogger
+	cfg            *config.RocketPoolConfig
+	w              wallet.Wallet
+	rp             *rocketpool.RocketPool
+	bc             beacon.Client
+	d              *client.Client
+	gasThreshold   float64
+	maxFee         *big.Int
+	maxPriorityFee *big.Int
+	gasLimit       uint64
+}
+
+// Create stake megapool validator task
+func newDefendChallengeExit(c *cli.Command, logger log.ColorLogger) (*defendChallengeExit, error) {
+
+	// Get services
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	d, err := services.GetDocker(c)
+	if err != nil {
+		return nil, err
+	}
+	bc, err := services.GetBeaconClient(c)
+	if err != nil {
+		return nil, err
+	}
+
+	gas := loadAutoTxGas(cfg, &logger)
+
+	// Return task
+	return &defendChallengeExit{
+		c:              c,
+		log:            logger,
+		cfg:            cfg,
+		w:              w,
+		rp:             rp,
+		bc:             bc,
+		d:              d,
+		gasThreshold:   gas.thresholdGwei,
+		maxFee:         gas.maxFee,
+		maxPriorityFee: gas.maxPriorityFee,
+		gasLimit:       0,
+	}, nil
+
+}
+
+// Prestake megapool validator
+func (t *defendChallengeExit) run(state *state.NetworkStateIndex) error {
+	// Log
+	t.log.Println("Checking for validators with an incorrect exit challenge ...")
+
+	// Get the latest state
+	opts := &bind.CallOpts{
+		BlockNumber: big.NewInt(0).SetUint64(state.ElBlockNumber),
+	}
+
+	// Get node account
+	nodeAccount, err := t.w.GetNodeAccount()
+	if err != nil {
+		return err
+	}
+
+	// Check if the megapool is deployed
+	deployed, err := megapool.GetMegapoolDeployed(t.rp, nodeAccount.Address, opts)
+	if err != nil {
+		return err
+	}
+	if !deployed {
+		return nil
+	}
+
+	// Get the megapool address
+	megapoolAddress, err := megapool.GetMegapoolExpectedAddress(t.rp, nodeAccount.Address, opts)
+	if err != nil {
+		return err
+	}
+
+	// Load the megapool
+	mp, err := megapool.NewMegaPoolV1(t.rp, megapoolAddress, nil)
+	if err != nil {
+		return err
+	}
+
+	// Iterate over megapool validators checking whether they were incorrectly challenged
+	validatorInfo, err := services.GetMegapoolValidatorDetails(t.rp, t.bc, megapoolAddress, opts, false)
+	if err != nil {
+		return err
+	}
+
+	for i := uint32(0); i < uint32(len(validatorInfo)); i++ {
+		exiting := false
+		if validatorInfo[i].Locked {
+			if validatorInfo[i].BeaconStatus.WithdrawableEpoch != FarFutureEpoch {
+				exiting = true
+				t.log.Printlnf("The validator %d was correctly challenged and needs an exit proof", validatorInfo[i].ValidatorId)
+			} else {
+				t.log.Printlnf("The validator %d was incorrectly challenged and needs a not-exiting proof", validatorInfo[i].ValidatorId)
+			}
+
+			err := t.defendChallenge(t.rp, mp, validatorInfo[i].ValidatorId, types.ValidatorPubkey(validatorInfo[i].PubKey), exiting)
+			if err != nil {
+				t.log.Printlnf("error defending the challenge: %v", err)
+			}
+		}
+
+	}
+
+	// Return
+	return nil
+
+}
+
+func (t *defendChallengeExit) defendChallenge(rp *rocketpool.RocketPool, mp megapool.Megapool, validatorId uint32, validatorPubkey types.ValidatorPubkey, exiting bool) error {
+
+	// Get transactor
+	opts, err := t.w.GetNodeAccountTransactor()
+	if err != nil {
+		return err
+	}
+
+	t.log.Printlnf("Crafting a validator proof.")
+
+	beaconState, slotTimestamp, err := services.GetHeadBeaconState(t.bc, rp.Client)
+	if err != nil {
+		return err
+	}
+	validatorProof, slotProof, err := services.GetValidatorProofFromState(t.bc, validatorPubkey, beaconState)
+	if err != nil {
+		t.log.Printlnf("[ERROR] There was an error during the proof creation process: %v", err)
+		return err
+	}
+	if exiting && validatorProof.Validator.WithdrawableEpoch >= FarFutureEpoch {
+		return fmt.Errorf("validator %d exit is not yet visible in the selected beacon state; will retry on next cycle", validatorId)
+	}
+	if !exiting && validatorProof.Validator.WithdrawableEpoch != FarFutureEpoch {
+		return fmt.Errorf("validator %d is exiting in the selected beacon state; will retry on next cycle", validatorId)
+	}
+
+	t.log.Printlnf("The beacon state proof has been successfully created.")
+	var gasLimits gaslimit.Limits
+
+	if !exiting {
+		// Get the gas limit
+		gasLimits, err = services.EstimateMegapoolNotifyNotExitGas(rp, mp.GetAddress(), validatorId, slotTimestamp, validatorProof, slotProof, opts)
+		if err != nil {
+			return err
+		}
+	} else {
+		gasLimits, err = services.EstimateMegapoolNotifyExitGas(rp, mp.GetAddress(), validatorId, slotTimestamp, validatorProof, slotProof, opts)
+		if err != nil {
+			return err
+		}
+	}
+
+	gas := big.NewInt(int64(gasLimits.Safe))
+	// Get the max fee
+	maxFee := t.maxFee
+	if maxFee == nil || maxFee.Uint64() == 0 {
+		maxFee, err = rpgas.GetHeadlessMaxFeeWeiWithLatestBlock(t.cfg, t.rp)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Print the gas info
+	if !gasLimits.PrintAndCheck(true, t.gasThreshold, &t.log, maxFee, t.gasLimit) {
+		return nil
+	}
+
+	opts.GasFeeCap = maxFee
+	opts.GasTipCap = GetPriorityFee(t.maxPriorityFee, maxFee)
+	opts.GasLimit = gas.Uint64()
+
+	var tx *coretypes.Transaction
+	if !exiting {
+		t.log.Printlnf("Notifying that validator %d is not exiting.", validatorId)
+		tx, err = services.NotifyMegapoolNotExit(rp, mp.GetAddress(), validatorId, slotTimestamp, validatorProof, slotProof, opts)
+		if err != nil {
+			return err
+		}
+	} else {
+		t.log.Printlnf("Notifying that validator %d is exiting.", validatorId)
+		tx, err = services.NotifyMegapoolExit(rp, mp.GetAddress(), validatorId, slotTimestamp, validatorProof, slotProof, opts)
+		if err != nil {
+			return err
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	// Print TX info and wait for it to be included in a block
+	err = transactions.PrintAndWaitForTransaction(t.cfg, tx.Hash(), t.rp.Client, &t.log)
+	if err != nil {
+		return err
+	}
+
+	// Log
+	t.log.Printlnf("Successfully responded to exit-challenge for validator %d.", validatorId)
+
+	// Return
+	return nil
+}

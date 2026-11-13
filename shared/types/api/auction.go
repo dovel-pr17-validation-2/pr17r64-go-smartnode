@@ -1,0 +1,88 @@
+package api
+
+import (
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/common"
+
+	"github.com/rocket-pool/smartnode/bindings/auction"
+	"github.com/rocket-pool/smartnode/bindings/transactions/gaslimit"
+)
+
+type AuctionStatusResponse struct {
+	APIResponse
+	TotalRPLBalance     *big.Int `json:"totalRPLBalance"`
+	AllottedRPLBalance  *big.Int `json:"allottedRPLBalance"`
+	RemainingRPLBalance *big.Int `json:"remainingRPLBalance"`
+	CanCreateLot        bool     `json:"canCreateLot"`
+	LotCounts           struct {
+		ClaimAvailable       int `json:"claimAvailable"`
+		BiddingAvailable     int `json:"biddingAvailable"`
+		RPLRecoveryAvailable int `json:"rplRecoveryAvailable"`
+	} `json:"lotCounts"`
+}
+
+type AuctionLotsResponse struct {
+	APIResponse
+	Lots []LotDetails `json:"lots"`
+}
+type LotDetails struct {
+	Details              auction.LotDetails `json:"details"`
+	ClaimAvailable       bool               `json:"claimAvailable"`
+	BiddingAvailable     bool               `json:"biddingAvailable"`
+	RPLRecoveryAvailable bool               `json:"rplRecoveryAvailable"`
+}
+
+type CanCreateLotResponse struct {
+	APIResponse
+	CanCreate           bool            `json:"canCreate"`
+	InsufficientBalance bool            `json:"insufficientBalance"`
+	CreateLotDisabled   bool            `json:"createLotDisabled"`
+	GasLimits           gaslimit.Limits `json:"gasLimits"`
+}
+type CreateLotResponse struct {
+	APIResponse
+	LotId  uint64      `json:"lotId"`
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanBidOnLotResponse struct {
+	APIResponse
+	CanBid           bool            `json:"canBid"`
+	DoesNotExist     bool            `json:"doesNotExist"`
+	BiddingEnded     bool            `json:"biddingEnded"`
+	RPLExhausted     bool            `json:"rplExhausted"`
+	BidOnLotDisabled bool            `json:"bidOnLotDisabled"`
+	GasLimits        gaslimit.Limits `json:"gasLimits"`
+}
+type BidOnLotResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanClaimFromLotResponse struct {
+	APIResponse
+	CanClaim         bool            `json:"canClaim"`
+	DoesNotExist     bool            `json:"doesNotExist"`
+	NoBidFromAddress bool            `json:"noBidFromAddress"`
+	NotCleared       bool            `json:"notCleared"`
+	GasLimits        gaslimit.Limits `json:"gasLimits"`
+}
+type ClaimFromLotResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}
+
+type CanRecoverRPLFromLotResponse struct {
+	APIResponse
+	CanRecover          bool            `json:"canRecover"`
+	DoesNotExist        bool            `json:"doesNotExist"`
+	BiddingNotEnded     bool            `json:"biddingNotEnded"`
+	NoUnclaimedRPL      bool            `json:"noUnclaimedRpl"`
+	RPLAlreadyRecovered bool            `json:"rplAlreadyRecovered"`
+	GasLimits           gaslimit.Limits `json:"gasLimits"`
+}
+type RecoverRPLFromLotResponse struct {
+	APIResponse
+	TxHash common.Hash `json:"txHash"`
+}

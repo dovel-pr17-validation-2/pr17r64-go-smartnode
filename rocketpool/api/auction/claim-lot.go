@@ -1,0 +1,149 @@
+package auction
+
+import (
+	"math/big"
+
+	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/rocket-pool/smartnode/bindings/auction"
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func canClaimFromLot(c *cli.Command, lotIndex uint64) (*api.CanClaimFromLotResponse, error) {
+
+	// Get services
+	if err := services.RequireNodeWallet(c); err != nil {
+		return nil, err
+	}
+	if err := services.RequireRocketStorage(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.CanClaimFromLotResponse{}
+
+	// Sync
+	var wg errgroup.Group
+
+	// Check if lot exists
+	wg.Go(func() error {
+		lotExists, err := auction.GetLotExists(rp, lotIndex, nil)
+		if err == nil {
+			response.DoesNotExist = !lotExists
+		}
+		return err
+	})
+
+	// Check if address has bid
+	wg.Go(func() error {
+		nodeAccount, err := w.GetNodeAccount()
+		if err != nil {
+			return err
+		}
+		addressBidAmount, err := auction.GetLotAddressBidAmount(rp, lotIndex, nodeAccount.Address, nil)
+		if err == nil {
+			response.NoBidFromAddress = (addressBidAmount.Cmp(big.NewInt(0)) == 0)
+		}
+		return err
+	})
+
+	// Check if lot has cleared
+	wg.Go(func() error {
+		isCleared, err := auction.GetLotIsCleared(rp, lotIndex, nil)
+		if err == nil {
+			response.NotCleared = !isCleared
+		}
+		return err
+	})
+
+	// Get gas estimate
+	wg.Go(func() error {
+		opts, err := w.GetNodeAccountTransactor()
+		if err != nil {
+			return err
+		}
+		gasLimits, err := auction.EstimateClaimBidGas(rp, lotIndex, opts)
+		if err == nil {
+			response.GasLimits = gasLimits
+		}
+		return err
+	})
+
+	// Wait for data
+	if err := wg.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Update & return response
+	response.CanClaim = !response.DoesNotExist && !response.NoBidFromAddress && !response.NotCleared
+	return &response, nil
+
+}
+
+func claimFromLot(c *cli.Command, lotIndex uint64, t *snroute.TransactOpts) (*api.ClaimFromLotResponse, error) {
+	opts := t.Opts()
+
+	// Get services
+	if err := services.RequireNodeWallet(c); err != nil {
+		return nil, err
+	}
+	if err := services.RequireRocketStorage(c); err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.ClaimFromLotResponse{}
+
+	// Claim from lot
+	hash, err := auction.ClaimBid(rp, lotIndex, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.TxHash = hash
+
+	// Return response
+	return &response, nil
+
+}
+
+func canClaimLotHandler(ctx snroute.Context) {
+	lotIndex, err := parseLotIndex(ctx.Request)
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := canClaimFromLot(ctx.Command(), lotIndex)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func claimLotHandler(ctx snroute.WriteContext) {
+	lotIndex, err := parseLotIndex(ctx.Request)
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := claimFromLot(ctx.Command(), lotIndex, opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}

@@ -1,0 +1,300 @@
+package node
+
+import (
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/common"
+
+	"github.com/urfave/cli/v3"
+
+	"github.com/rocket-pool/smartnode/bindings/node"
+	"github.com/rocket-pool/smartnode/bindings/tokens"
+	"github.com/rocket-pool/smartnode/bindings/utils"
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func canNodeStakeRpl(c *cli.Command, amountWei *big.Int) (*api.CanNodeStakeRplResponse, error) {
+
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.CanNodeStakeRplResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Check RPL balance
+	rplBalance, err := tokens.GetRPLBalance(rp, nodeAccount.Address, nil)
+	if err != nil {
+		return nil, err
+	}
+	response.InsufficientBalance = (amountWei.Cmp(rplBalance) > 0)
+
+	// Get gas estimates
+	opts, err := w.GetNodeAccountTransactor()
+	if err != nil {
+		return nil, err
+	}
+	gasLimits, err := node.EstimateStakeGas(rp, amountWei, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.GasLimits = gasLimits
+
+	// Update & return response
+	response.CanStake = !(response.InsufficientBalance)
+	return &response, nil
+
+}
+
+func getStakeApprovalGas(c *cli.Command, amountWei *big.Int) (*api.NodeStakeRplApproveGasResponse, error) {
+	// Get services
+	if err := services.RequireNodeWallet(c); err != nil {
+		return nil, err
+	}
+	if err := services.RequireRocketStorage(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.NodeStakeRplApproveGasResponse{}
+
+	// Get staking contract address
+	rocketNodeStakingAddress, err := rp.GetAddress("rocketNodeStaking", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get gas estimates
+	opts, err := w.GetNodeAccountTransactor()
+	if err != nil {
+		return nil, err
+	}
+	gasLimits, err := tokens.EstimateApproveRPLGas(rp, *rocketNodeStakingAddress, amountWei, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.GasLimits = gasLimits
+	return &response, nil
+}
+
+func allowanceRpl(c *cli.Command) (*api.NodeStakeRplAllowanceResponse, error) {
+
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.NodeStakeRplAllowanceResponse{}
+
+	// Get staking contract address
+	rocketNodeStakingAddress, err := rp.GetAddress("rocketNodeStaking", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get node account
+	account, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get node's RPL allowance
+	allowance, err := tokens.GetRPLAllowance(rp, account.Address, *rocketNodeStakingAddress, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	response.Allowance = allowance
+
+	return &response, nil
+}
+
+func approveRpl(c *cli.Command, amountWei *big.Int, t *snroute.TransactOpts) (*api.NodeStakeRplApproveResponse, error) {
+	opts := t.Opts()
+
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.NodeStakeRplApproveResponse{}
+
+	// Get staking contract address
+	rocketNodeStakingAddress, err := rp.GetAddress("rocketNodeStaking", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Approve RPL allowance
+	hash, err := tokens.ApproveRPL(rp, *rocketNodeStakingAddress, amountWei, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	response.ApproveTxHash = hash
+
+	// Return response
+	return &response, nil
+
+}
+
+func waitForApprovalAndStakeRpl(c *cli.Command, amountWei *big.Int, hash common.Hash, t *snroute.TransactOpts) (*api.NodeStakeRplStakeResponse, error) {
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait for the RPL approval TX to successfully get included in a block
+	_, err = utils.WaitForTransaction(rp.Client, hash)
+	if err != nil {
+		return nil, err
+	}
+
+	// Perform the stake
+	return stakeRpl(c, amountWei, t)
+
+}
+
+func stakeRpl(c *cli.Command, amountWei *big.Int, t *snroute.TransactOpts) (*api.NodeStakeRplStakeResponse, error) {
+	opts := t.Opts()
+
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.NodeStakeRplStakeResponse{}
+
+	// Stake RPL
+	hash, err := node.StakeRPL(rp, amountWei, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	response.StakeTxHash = hash
+
+	// Return response
+	return &response, nil
+
+}
+
+func stakeRplAllowanceHandler(ctx snroute.Context) {
+	resp, err := allowanceRpl(ctx.Command())
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func canStakeRplHandler(ctx snroute.Context) {
+	amountWei, err := parseNodeBigInt(ctx.Request, "amountWei")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := canNodeStakeRpl(ctx.Command(), amountWei)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func getStakeRplApprovalGasHandler(ctx snroute.Context) {
+	amountWei, err := parseNodeBigInt(ctx.Request, "amountWei")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := getStakeApprovalGas(ctx.Command(), amountWei)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func stakeRplApproveRplHandler(ctx snroute.WriteContext) {
+	amountWei, err := parseNodeBigInt(ctx.Request, "amountWei")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := approveRpl(ctx.Command(), amountWei, opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func waitAndStakeRplHandler(ctx snroute.WriteContext) {
+	amountWei, err := parseNodeBigInt(ctx.Request, "amountWei")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	hash := common.HexToHash(ctx.Request.FormValue("approvalTxHash"))
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := waitForApprovalAndStakeRpl(ctx.Command(), amountWei, hash, opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func stakeRplHandler(ctx snroute.WriteContext) {
+	amountWei, err := parseNodeBigInt(ctx.Request, "amountWei")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := stakeRpl(ctx.Command(), amountWei, opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}

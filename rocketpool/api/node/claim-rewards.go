@@ -1,0 +1,495 @@
+package node
+
+import (
+	"fmt"
+	"math/big"
+	"strconv"
+	"strings"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/rocket-pool/smartnode/bindings/megapool"
+	"github.com/rocket-pool/smartnode/bindings/network"
+	"github.com/rocket-pool/smartnode/bindings/node"
+	"github.com/rocket-pool/smartnode/bindings/rewards"
+	"github.com/rocket-pool/smartnode/bindings/rocketpool"
+	"github.com/rocket-pool/smartnode/bindings/transactions/gaslimit"
+	"github.com/rocket-pool/smartnode/bindings/types"
+	"github.com/rocket-pool/smartnode/rocketpool/api/response"
+	"github.com/rocket-pool/smartnode/rocketpool/api/snroute"
+	"github.com/rocket-pool/smartnode/shared/math"
+	"github.com/rocket-pool/smartnode/shared/services"
+	"github.com/rocket-pool/smartnode/shared/services/config"
+	rprewards "github.com/rocket-pool/smartnode/shared/services/rewards"
+	"github.com/rocket-pool/smartnode/shared/types/api"
+)
+
+func getRewardsInfo(c *cli.Command) (*api.NodeGetRewardsInfoResponse, error) {
+
+	// Get services
+	if err := services.RequireNodeWallet(c); err != nil {
+		return nil, err
+	}
+	if err := services.RequireRocketStorage(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.NodeGetRewardsInfoResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	response.Registered, err = node.GetNodeExists(rp, nodeAccount.Address, nil)
+	if err != nil {
+		return nil, err
+	}
+	if !response.Registered {
+		return &response, nil
+	}
+
+	// Get the claimed and unclaimed intervals
+	unclaimed, claimed, err := rprewards.GetClaimStatus(rp, nodeAccount.Address)
+	if err != nil {
+		return nil, err
+	}
+	response.ClaimedIntervals = claimed
+
+	// Get the info for each unclaimed interval
+	for _, unclaimedInterval := range unclaimed {
+		intervalInfo, err := rprewards.GetIntervalInfo(rp, cfg, nodeAccount.Address, unclaimedInterval, nil)
+		if err != nil {
+			return nil, err
+		}
+		if !intervalInfo.TreeFileExists || !intervalInfo.MerkleRootValid {
+			response.InvalidIntervals = append(response.InvalidIntervals, intervalInfo)
+			continue
+		}
+		if intervalInfo.NodeExists {
+			response.UnclaimedIntervals = append(response.UnclaimedIntervals, intervalInfo)
+		}
+	}
+
+	for _, claimedInterval := range response.ClaimedIntervals {
+		intervalInfo, err := rprewards.GetIntervalInfo(rp, cfg, nodeAccount.Address, claimedInterval, nil)
+		if err != nil {
+			return nil, err
+		}
+		if !intervalInfo.TreeFileExists {
+			response.InvalidIntervals = append(response.InvalidIntervals, intervalInfo)
+			continue
+		}
+	}
+
+	// Get collateral info for restaking
+	var totalMinipools int
+	var finalizedMinipools int
+	details, err := getNodeMinipoolCountDetails(rp, nodeAccount.Address)
+	if err == nil {
+		totalMinipools = len(details)
+		for _, mpDetails := range details {
+			if mpDetails.Finalised {
+				finalizedMinipools++
+			}
+		}
+	}
+	activeMinipools := totalMinipools - finalizedMinipools
+	response.ActiveMinipools = activeMinipools
+
+	// Sync
+	var wg errgroup.Group
+	var activeMegapoolValidators int
+
+	wg.Go(func() error {
+		var err error
+		response.RplStake, err = node.GetNodeStakedRPL(rp, nodeAccount.Address, nil)
+		return err
+	})
+
+	wg.Go(func() error {
+		var err error
+		// Check if the megapool is deployed
+		megapoolDeployed, err := megapool.GetMegapoolDeployed(rp, nodeAccount.Address, nil)
+		if err != nil {
+			return err
+		}
+		if megapoolDeployed {
+			// Get megapool address and active validator count
+			megapoolAddress, err := megapool.GetMegapoolExpectedAddress(rp, nodeAccount.Address, nil)
+			if err == nil {
+				mp, err := megapool.NewMegaPoolV1(rp, megapoolAddress, nil)
+				if err == nil {
+					count, err := mp.GetActiveValidatorCount(nil)
+					if err == nil {
+						activeMegapoolValidators += int(count)
+						response.ActiveMegapoolValidators = activeMegapoolValidators
+					}
+				}
+			}
+		}
+		return err
+	})
+
+	wg.Go(func() error {
+		var err error
+		response.RplPrice, err = network.GetRPLPrice(rp, nil)
+		return err
+	})
+
+	// Wait for data
+	if err := wg.Wait(); err != nil {
+		return nil, err
+	}
+
+	totalActiveValidators := activeMinipools + activeMegapoolValidators
+	if totalActiveValidators > 0 {
+		var wg2 errgroup.Group
+		wg2.Go(func() error {
+			var err error
+			response.EthBorrowed, response.EthBorrowLimit, response.PendingBorrowAmount, err = CheckCollateral(rp, nodeAccount.Address, nil)
+			return err
+		})
+
+		// Wait for data
+		if err := wg2.Wait(); err != nil {
+			return nil, err
+		}
+
+		// bonded eth = total validators * 32 - borrowed
+		totalBorrowedEth := math.WeiToEth(response.EthBorrowed) + math.WeiToEth(response.PendingBorrowAmount)
+		totalBondedEth := float64(totalActiveValidators)*32.0 - totalBorrowedEth
+
+		// Calculate collateral ratios
+		if totalBondedEth <= 0 {
+			response.BondedCollateralRatio = 0
+		} else {
+			response.BondedCollateralRatio = math.WeiToEth(response.RplPrice) * math.WeiToEth(response.RplStake) / totalBondedEth
+		}
+
+		if totalBorrowedEth <= 0 {
+			response.BorrowedCollateralRatio = 0
+		} else {
+			response.BorrowedCollateralRatio = math.WeiToEth(response.RplPrice) * math.WeiToEth(response.RplStake) / totalBorrowedEth
+		}
+	}
+
+	return &response, nil
+}
+
+func canClaimRewards(c *cli.Command, indicesString string) (*api.CanNodeClaimRewardsResponse, error) {
+
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.CanNodeClaimRewardsResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get gas estimate
+	opts, err := w.GetNodeAccountTransactor()
+	if err != nil {
+		return nil, err
+	}
+
+	var gasLimits gaslimit.Limits
+	claims, err := getRewardsForIntervals(rp, cfg, nodeAccount.Address, indicesString)
+	if err != nil {
+		return nil, err
+	}
+	gasLimits, err = rewards.EstimateClaimGas(rp, nodeAccount.Address, claims, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.GasLimits = gasLimits
+	return &response, nil
+}
+
+func claimRewards(c *cli.Command, indicesString string, t *snroute.TransactOpts) (*api.NodeClaimRewardsResponse, error) {
+	opts := t.Opts()
+
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.NodeClaimRewardsResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the rewards
+	claims, err := getRewardsForIntervals(rp, cfg, nodeAccount.Address, indicesString)
+	if err != nil {
+		return nil, err
+	}
+	hash, err := rewards.Claim(rp, nodeAccount.Address, claims, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.TxHash = hash
+
+	// Return response
+	return &response, nil
+
+}
+
+func canClaimAndStakeRewards(c *cli.Command, indicesString string, stakeAmount *big.Int) (*api.CanNodeClaimAndStakeRewardsResponse, error) {
+
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.CanNodeClaimAndStakeRewardsResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get gas estimate
+	opts, err := w.GetNodeAccountTransactor()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the rewards
+	claims, err := getRewardsForIntervals(rp, cfg, nodeAccount.Address, indicesString)
+	if err != nil {
+		return nil, err
+	}
+	gasLimits, err := rewards.EstimateClaimAndStakeGas(rp, nodeAccount.Address, claims, stakeAmount, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.GasLimits = gasLimits
+
+	return &response, nil
+
+}
+
+func claimAndStakeRewards(c *cli.Command, indicesString string, stakeAmount *big.Int, t *snroute.TransactOpts) (*api.NodeClaimAndStakeRewardsResponse, error) {
+	opts := t.Opts()
+
+	// Get services
+	if err := services.RequireNodeRegistered(c); err != nil {
+		return nil, err
+	}
+	w, err := services.GetWallet(c)
+	if err != nil {
+		return nil, err
+	}
+	rp, err := services.GetRocketPool(c)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := services.GetConfig(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response
+	response := api.NodeClaimAndStakeRewardsResponse{}
+
+	// Get node account
+	nodeAccount, err := w.GetNodeAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the rewards
+	claims, err := getRewardsForIntervals(rp, cfg, nodeAccount.Address, indicesString)
+	if err != nil {
+		return nil, err
+	}
+	hash, err := rewards.ClaimAndStake(rp, nodeAccount.Address, claims, stakeAmount, opts)
+	if err != nil {
+		return nil, err
+	}
+	response.TxHash = hash
+
+	// Return response
+	return &response, nil
+
+}
+
+// Get the rewards for the provided interval indices
+func getRewardsForIntervals(rp *rocketpool.RocketPool, cfg *config.RocketPoolConfig, nodeAddress common.Address, indicesString string) (types.Claims, error) {
+
+	// Get the indices
+	seenIndices := map[uint64]bool{}
+	elements := strings.Split(indicesString, ",")
+	indices := []*big.Int{}
+	for _, element := range elements {
+		index, err := strconv.ParseUint(element, 0, 64)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert index %s to a number: %w", element, err)
+		}
+		// Ignore duplicates
+		_, exists := seenIndices[index]
+		if !exists {
+			indices = append(indices, big.NewInt(0).SetUint64(index))
+			seenIndices[index] = true
+		}
+	}
+
+	// Read the tree files to get the details
+	claims := types.Claims{}
+
+	// Populate the interval info for each one
+	for _, index := range indices {
+
+		intervalInfo, err := rprewards.GetIntervalInfo(rp, cfg, nodeAddress, index.Uint64(), nil)
+		if err != nil {
+			return nil, err
+		}
+
+		// Validate
+		if !intervalInfo.TreeFileExists {
+			return nil, fmt.Errorf("rewards tree file '%s' doesn't exist", intervalInfo.TreeFilePath)
+		}
+		if !intervalInfo.MerkleRootValid {
+			return nil, fmt.Errorf("merkle root for rewards tree file '%s' doesn't match the canonical merkle root for interval %d", intervalInfo.TreeFilePath, index.Uint64())
+		}
+
+		// Get the rewards from it
+		if intervalInfo.NodeExists {
+			rplForInterval := big.NewInt(0)
+			rplForInterval.Add(rplForInterval, &intervalInfo.CollateralRplAmount.Int)
+			rplForInterval.Add(rplForInterval, &intervalInfo.ODaoRplAmount.Int)
+
+			smoothingEthForInterval := big.NewInt(0)
+			smoothingEthForInterval.Add(smoothingEthForInterval, &intervalInfo.SmoothingPoolEthAmount.Int)
+
+			voterShareEthForInterval := big.NewInt(0)
+			voterShareEthForInterval.Add(voterShareEthForInterval, &intervalInfo.VoterShareEth.Int)
+
+			claims = append(claims, types.Claim{
+				RewardIndex:            index,
+				AmountRPL:              rplForInterval,
+				AmountSmoothingPoolETH: smoothingEthForInterval,
+				AmountVoterETH:         voterShareEthForInterval,
+				MerkleProof:            intervalInfo.MerkleProof,
+			})
+		}
+	}
+
+	// Return
+	return claims, nil
+
+}
+
+func getRewardsInfoHandler(ctx snroute.Context) {
+	resp, err := getRewardsInfo(ctx.Command())
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func canClaimRewardsHandler(ctx snroute.Context) {
+	indices := ctx.Request.URL.Query().Get("indices")
+	resp, err := canClaimRewards(ctx.Command(), indices)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func claimRewardsHandler(ctx snroute.WriteContext) {
+	indices := ctx.Request.FormValue("indices")
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := claimRewards(ctx.Command(), indices, opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func canClaimAndStakeRewardsHandler(ctx snroute.Context) {
+	indices := ctx.Request.URL.Query().Get("indices")
+	stakeAmount, err := parseNodeBigInt(ctx.Request, "stakeAmount")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := canClaimAndStakeRewards(ctx.Command(), indices, stakeAmount)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
+
+func claimAndStakeRewardsHandler(ctx snroute.WriteContext) {
+	indices := ctx.Request.FormValue("indices")
+	stakeAmount, err := parseNodeBigInt(ctx.Request, "stakeAmount")
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	opts, err := ctx.Transactor()
+	if err != nil {
+		response.WriteErrorResponse(ctx.Writer, err)
+		return
+	}
+	resp, err := claimAndStakeRewards(ctx.Command(), indices, stakeAmount, opts)
+	response.WriteResponse(ctx.Writer, resp, err)
+}
